@@ -51,19 +51,65 @@ class MappingStore:
             mapping[fake] = real
             self.path.write_text(json.dumps(mapping, indent=2))
 
+    def save_pair_avoiding_collision(self, real: str, generator, max_attempts: int = 1000) -> str:
+        """Record real -> fake using `generator(real, salt)` to produce
+        candidate fakes, retrying with an incrementing salt if a
+        candidate is already mapped to a DIFFERENT real value.
 
-def fake_ip(real_value: str) -> str:
+        save_pair() alone stores fake->real as a plain dict key, so if
+        two distinct real values ever hash to the same fake, the
+        second save silently overwrites the first -- both real values
+        then restore to whichever was saved last, and the first is
+        permanently unrecoverable. This is the fix for that: never
+        overwrite an existing fake that belongs to a different real
+        value, generate an alternate instead."""
+        with self._lock:
+            mapping = self.load()
+            salt = 0
+            while True:
+                fake = generator(real, salt)
+                existing = mapping.get(fake)
+                if existing is None or existing == real:
+                    mapping[fake] = real
+                    self.path.write_text(json.dumps(mapping, indent=2))
+                    return fake
+                salt += 1
+                if salt > max_attempts:
+                    # Pool effectively exhausted -- extremely unlikely.
+                    # Accept the collision rather than loop forever;
+                    # still better than crashing the whole request.
+                    mapping[fake] = real
+                    self.path.write_text(json.dumps(mapping, indent=2))
+                    return fake
+
+
+def fake_ip(real_value: str, salt: int = 0) -> str:
     """Deterministic fake IP: same real IP always maps to the same
     fake one, different real IPs map to different fakes. This
     consistency property is what lets an agent still reason about
-    subnet membership / NSG rule matching without seeing real IPs."""
-    h = hashlib.sha256(real_value.encode()).hexdigest()
-    return f"10.99.{int(h[0:2], 16)}.{int(h[2:4], 16)}"
+    subnet membership / NSG rule matching without seeing real IPs.
+
+    Preserves a CIDR suffix (e.g. "/24") on the *visible* fake instead
+    of dropping it -- losing it left a fake host address where the
+    model needed to reason about a subnet's size.
+
+    `salt` lets a caller request an alternate fake when the default
+    collides with an unrelated real value already in the mapping (see
+    save_pair_avoiding_collision) -- the fake-IP space is only 16 bits
+    wide, so collisions across many distinct real IPs are plausible,
+    not just theoretical."""
+    base, sep, cidr = real_value.partition('/')
+    h = hashlib.sha256(f"{base}:{salt}".encode()).hexdigest()
+    fake = f"10.99.{int(h[0:2], 16)}.{int(h[2:4], 16)}"
+    return f"{fake}{sep}{cidr}" if sep else fake
 
 
-def fake_guid(real_value: str) -> str:
-    """Deterministic fake GUID, same consistency property as fake_ip."""
-    h = hashlib.sha256(real_value.encode()).hexdigest()
+def fake_guid(real_value: str, salt: int = 0) -> str:
+    """Deterministic fake GUID, same consistency property as fake_ip.
+    128 bits of hash output makes an accidental collision practically
+    impossible, but `salt` is still accepted so it shares the same
+    collision-avoidance calling convention as fake_ip/fake_name."""
+    h = hashlib.sha256(f"{real_value}:{salt}".encode()).hexdigest()
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
@@ -81,14 +127,21 @@ _FAKE_LOCATIONS = [
 ]
 
 
-def fake_name(real_value: str, entity_type: str) -> str:
+def fake_name(real_value: str, entity_type: str, salt: int = 0) -> str:
     """Deterministic fake for a Presidio-detected entity: same
     (entity_type, real_value) pair always maps to the same fake, same
     consistency property as fake_ip/fake_guid, so the same person
     mentioned twice in a document still reads as the same person
     without exposing who they are. Falls back to a labeled placeholder
-    for entity types without a dedicated generator."""
-    h = hashlib.sha256(f"{entity_type}:{real_value}".encode()).hexdigest()
+    for entity types without a dedicated generator.
+
+    The PERSON/LOCATION pools below are small (a few hundred / ten
+    combinations), so two distinct real values WILL collide on the
+    same fake often enough to matter in real use -- `salt` lets a
+    caller request a different fake for the same real_value when that
+    happens (see save_pair_avoiding_collision), instead of silently
+    losing one of the two real values on restore."""
+    h = hashlib.sha256(f"{entity_type}:{real_value}:{salt}".encode()).hexdigest()
     idx = int(h[:8], 16)
 
     if entity_type == "PERSON":
@@ -139,6 +192,23 @@ def warm_presidio():
     _get_presidio_analyzer()
 
 
+def _drop_overlapping_spans(results):
+    """Presidio can return overlapping spans for the same stretch of
+    text (e.g. a full EMAIL_ADDRESS match and a lower-confidence URL
+    match covering just its domain). Replacing both independently,
+    each computed against the ORIGINAL text's offsets, corrupts the
+    output -- and stores a mangled fragment as a "real" value in the
+    mapping, which then gets written back to disk verbatim on restore.
+    Keep the highest-scoring span in each overlapping cluster (ties
+    broken by longer span) and drop the rest."""
+    ordered = sorted(results, key=lambda r: (-r.score, -(r.end - r.start)))
+    kept = []
+    for r in ordered:
+        if not any(r.start < k.end and k.start < r.end for k in kept):
+            kept.append(r)
+    return kept
+
+
 def redact_presidio(text: str, entities: list, mapping_store: MappingStore = None,
                      score_threshold: float = 0.5) -> str:
     """Run Presidio NER over text and replace detected entities with
@@ -152,6 +222,7 @@ def redact_presidio(text: str, entities: list, mapping_store: MappingStore = Non
         r for r in analyzer.analyze(text=text, entities=entities, language="en")
         if r.score >= score_threshold
     ]
+    results = _drop_overlapping_spans(results)
     # Replace from the end of the string backward so earlier offsets
     # don't shift out from under us as later-in-string entities are
     # substituted first.
@@ -159,9 +230,12 @@ def redact_presidio(text: str, entities: list, mapping_store: MappingStore = Non
 
     for r in results:
         real_value = text[r.start:r.end]
-        fake_value = fake_name(real_value, r.entity_type)
         if mapping_store:
-            mapping_store.save_pair(fake_value, real_value)
+            fake_value = mapping_store.save_pair_avoiding_collision(
+                real_value, lambda real, salt, et=r.entity_type: fake_name(real, et, salt)
+            )
+        else:
+            fake_value = fake_name(real_value, r.entity_type)
         text = text[:r.start] + fake_value + text[r.end:]
 
     return text
@@ -180,14 +254,14 @@ class RuleSet:
     @staticmethod
     def _make_generator_replacer(generator_fn, mapping_store):
         """Build a re.sub replacer that generates a fake value once per
-        match, optionally recording it in the mapping store, without
-        calling the generator function twice per match."""
+        match, recording it in the mapping store with collision
+        avoidance (see MappingStore.save_pair_avoiding_collision) so two
+        distinct real values never silently share one fake."""
         def replacer(m):
             real_value = m.group(0)
-            fake_value = generator_fn(real_value)
             if mapping_store:
-                mapping_store.save_pair(fake_value, real_value)
-            return fake_value
+                return mapping_store.save_pair_avoiding_collision(real_value, generator_fn)
+            return generator_fn(real_value, 0)
         return replacer
 
     @classmethod
@@ -266,7 +340,13 @@ def redact(text: str, ruleset: RuleSet) -> str:
             # whole over any single rule.
             continue
     if ruleset.presidio_entities:
-        text = redact_presidio(text, ruleset.presidio_entities, ruleset.mapping_store)
+        try:
+            text = redact_presidio(text, ruleset.presidio_entities, ruleset.mapping_store)
+        except Exception:
+            # Same availability-over-any-single-rule tradeoff as the
+            # regex loop above: a NER failure must not 500 the whole
+            # request.
+            pass
     return text
 
 

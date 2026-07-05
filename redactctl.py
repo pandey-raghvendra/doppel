@@ -165,6 +165,17 @@ def load_ruleset(verbose=True) -> RuleSet:
                   f"  pip install presidio-analyzer spacy && "
                   f"python -m spacy download en_core_web_sm", file=sys.stderr)
             sys.exit(1)
+        except Exception as e:
+            # Not just ImportError -- a missing/uninstalled spacy model
+            # surfaces as OSError, and a sandboxed/offline environment
+            # where Presidio tries to auto-download a model surfaces as
+            # an SSL/network error. Both look like a raw traceback to a
+            # user unless caught here too.
+            print(f"[redactctl] ERROR: a PRESIDIO rule is enabled but the "
+                  f"analyzer failed to initialize ({e}). Check that the "
+                  f"spacy model is installed:\n"
+                  f"  python -m spacy download en_core_web_sm", file=sys.stderr)
+            sys.exit(1)
 
     if verbose:
         for warning in ruleset.warnings:

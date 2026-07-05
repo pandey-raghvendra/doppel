@@ -219,6 +219,62 @@ def test_deterministic_fakes_are_stable_across_runs():
 
 
 # ---------------------------------------------------------------------
+# INCIDENT: fake_ip dropped a "/24" CIDR suffix entirely instead of
+# preserving it on the visible fake -- the model saw a bare host
+# address where a subnet was, breaking exactly the subnet-membership
+# reasoning this tool exists to preserve. Round-trip restore still
+# worked (the suffix was intact in the stored real value), so this bug
+# was invisible to a round-trip-only test; it needed a check of what
+# the model actually sees.
+# ---------------------------------------------------------------------
+
+def test_fake_ip_preserves_cidr_suffix_for_the_model(mapping_store):
+    ruleset = RuleSet.from_yaml_data({"rules": [IP_RULE]}, mapping_store)
+    redacted = redact("subnet = 10.20.0.0/24", ruleset)
+    assert redacted.split("=")[1].strip().endswith("/24"), (
+        "the model must still see the CIDR suffix to reason about subnet size"
+    )
+    restored = restore(redacted, mapping_store.load())
+    assert restored == "subnet = 10.20.0.0/24"
+
+
+# ---------------------------------------------------------------------
+# INCIDENT: MappingStore.save_pair() overwrote blindly on a fake-value
+# collision -- two distinct real values that happened to hash to the
+# same fake would silently share one mapping entry, and restoring
+# either occurrence afterward produced whichever real value was saved
+# LAST, permanently losing the other. Reproduced with fake_ip's 16-bit
+# output space (2 real IPs deliberately forced to collide via a stub
+# generator) since that's the generator most likely to collide in
+# practice.
+# ---------------------------------------------------------------------
+
+def test_collision_avoidance_keeps_both_real_values_recoverable(mapping_store):
+    def always_same_fake_at_salt_zero(real, salt):
+        if salt == 0:
+            return "10.99.1.1"  # deliberate collision for any input
+        return f"10.99.1.{1 + salt}"
+
+    fake_a = mapping_store.save_pair_avoiding_collision("10.0.0.1", always_same_fake_at_salt_zero)
+    fake_b = mapping_store.save_pair_avoiding_collision("10.0.0.2", always_same_fake_at_salt_zero)
+
+    assert fake_a != fake_b, "colliding fakes must be disambiguated, not silently merged"
+    mapping = mapping_store.load()
+    assert restore(f"a={fake_a} b={fake_b}", mapping) == "a=10.0.0.1 b=10.0.0.2"
+
+
+def test_collision_avoidance_reuses_fake_for_the_same_real_value(mapping_store):
+    """Re-redacting the SAME real value must return its existing fake,
+    not treat it as a collision and burn a new salted alternative."""
+    def fixed_fake(real, salt):
+        return "10.99.9.9" if salt == 0 else f"10.99.9.{9 + salt}"
+
+    first = mapping_store.save_pair_avoiding_collision("10.0.0.5", fixed_fake)
+    second = mapping_store.save_pair_avoiding_collision("10.0.0.5", fixed_fake)
+    assert first == second == "10.99.9.9"
+
+
+# ---------------------------------------------------------------------
 # Phase 2: NER-based (Presidio) name/PII redaction. presidio-analyzer
 # and spacy are heavy optional dependencies -- skip just these tests,
 # not the whole file (module-level importorskip would skip every test
@@ -304,3 +360,53 @@ def test_presidio_runs_after_regex_rules_without_interference(mapping_store):
     result = redact(text, ruleset)
     assert "John Smith" not in result
     assert "323141ce" not in result
+
+
+# ---------------------------------------------------------------------
+# INCIDENT: Presidio returned overlapping spans for the same stretch of
+# text (a full EMAIL_ADDRESS match and a lower-confidence URL match
+# covering just its domain). Replacing both independently, each against
+# the ORIGINAL text's offsets, produced garbled output and stored a
+# corrupted fragment as a "real" value in the mapping -- which would
+# then have been written to disk verbatim by the restore hook.
+# ---------------------------------------------------------------------
+
+@requires_presidio
+def test_presidio_overlapping_spans_do_not_corrupt_output(mapping_store):
+    original = "John Smith emailed jane@example.com"
+    redacted = redact_presidio(
+        original, ["PERSON", "EMAIL_ADDRESS", "URL"], mapping_store=mapping_store,
+    )
+    assert "@" not in redacted or redacted.count("@") == 1
+    assert "]" not in redacted, "a stray '[TYPE_xxxx]' fragment means an overlap corrupted the text"
+    mapping = mapping_store.load()
+    for fake, real in mapping.items():
+        assert real in original, (
+            f"mapping stored {real!r} as a 'real' value, but it's not a substring of the "
+            f"original text -- an overlapping span corrupted it"
+        )
+    assert restore(redacted, mapping) == original
+
+
+# ---------------------------------------------------------------------
+# INCIDENT: the Presidio pass in redact() ran outside the regex loop's
+# try/except, so a NER failure (model crash, bad input) would 500 the
+# whole proxy request -- the exact single-bad-rule-crashes-everything
+# failure mode this module already guards against for regex rules.
+# ---------------------------------------------------------------------
+
+@requires_presidio
+def test_redact_survives_a_presidio_failure(monkeypatch, mapping_store):
+    import redactctl.core as core_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated NER crash")
+
+    monkeypatch.setattr(core_module, "redact_presidio", boom)
+    ruleset = RuleSet.from_yaml_data(
+        {"rules": [GUID_RULE, {"id": "pii", "category": "PRESIDIO", "entities": ["PERSON"]}]},
+        mapping_store=mapping_store,
+    )
+    text = 'subscription_id = "323141ce-56db-43a4-a7fb-6e491d10ddd6"'
+    result = redact(text, ruleset)  # must not raise
+    assert "323141ce" not in result, "the regex rule must still have run"

@@ -33,9 +33,10 @@ you -> redactctl proxy -> [redact] -> api.anthropic.com
 - **`redactctl/core.py`** — pure redaction/restore logic: YAML rule loading,
   deterministic fake generation (`fake_ip`, `fake_guid`, `fake_name`), a
   `MappingStore` that persists fake→real pairs so the proxy (writer) and the
-  restore hook (reader, separate process) can agree on them, and
-  `redact_request_body()` for structure-aware redaction of Messages API
-  requests (see Path drift in `THREAT_MODEL.md`).
+  restore hook (reader, separate process) can agree on them — safe across
+  concurrent processes via an OS-level `fcntl.flock`, not just an
+  in-process lock — and `redact_request_body()` for structure-aware
+  redaction of Messages API requests (see Path drift in `THREAT_MODEL.md`).
 - **`redactctl/cli.py`** — CLI (`init` / `start` / `status` / `test` /
   `restore-hook` / `redact-file` / `restore-file`) and the FastAPI proxy
   that sits in front of `api.anthropic.com`. `redactctl.py` at the repo

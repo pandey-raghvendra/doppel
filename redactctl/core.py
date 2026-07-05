@@ -338,18 +338,25 @@ class RuleSet:
                 warnings.append(msg)
                 replacer = "REDACTED"
 
-            rules.append((rule_id, pattern, replacer))
+            scope = r.get("scope", "all")
+            rules.append((rule_id, pattern, replacer, scope))
 
         return cls(rules, warnings, presidio_entities=presidio_entities, mapping_store=mapping_store,
                    presidio_thresholds=presidio_thresholds)
 
 
-def redact(text: str, ruleset: RuleSet) -> str:
+def redact(text: str, ruleset: RuleSet, include_scoped: bool = True) -> str:
     """Apply every rule in order. A single bad rule must never crash
     the whole request -- this was a real production incident
     (an undefined variable in a debug log line crashed every request
-    that reached it)."""
-    for rule_id, pattern, replacer in ruleset.rules:
+    that reached it).
+
+    include_scoped=False skips any rule marked scope: user-text-only
+    in its YAML definition -- see redact_request_body() for why this
+    exists and where it's set to False."""
+    for rule_id, pattern, replacer, scope in ruleset.rules:
+        if scope == "user-text-only" and not include_scoped:
+            continue
         try:
             text = pattern.sub(replacer, text)
         except Exception:
@@ -368,6 +375,95 @@ def redact(text: str, ruleset: RuleSet) -> str:
             # request.
             pass
     return text
+
+
+def _redact_safe_only(value, ruleset: RuleSet):
+    """Apply only the non-scoped ("all") rules, recursively over any
+    nested dict/list/str -- used for tool_use.input and tool_result
+    content, which is real tool execution data (command arguments,
+    command output), not human-authored prose. GUID/IP/PII values in
+    there are still worth catching, but a scope: user-text-only rule
+    (e.g. a client-name/region-token rewrite) must never touch it: the
+    model needs these exact values to reason correctly about its own
+    prior tool calls on the next turn."""
+    if isinstance(value, str):
+        return redact(value, ruleset, include_scoped=False)
+    if isinstance(value, dict):
+        return {k: _redact_safe_only(v, ruleset) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_safe_only(v, ruleset) for v in value]
+    return value
+
+
+def _redact_block(block, ruleset: RuleSet):
+    """Redact a single Messages API content block according to its
+    type -- this is the actual fix for the stray-directory incident.
+    A "text" block is genuine prose (from either role: it's still
+    prose whether the human typed it or the model generated it in its
+    previous turn) and gets the full ruleset, including scope:
+    user-text-only rules. A tool_use/tool_result block carries
+    structural, exact-match-required data -- even though the
+    surrounding message's role is "user" per the Messages API's own
+    convention for "here's what happened, your turn" -- so it only
+    gets the safe pass."""
+    if not isinstance(block, dict):
+        return block
+    block = dict(block)
+    block_type = block.get("type")
+    if block_type == "text" and "text" in block:
+        block["text"] = redact(block["text"], ruleset, include_scoped=True)
+    elif block_type == "tool_use" and "input" in block:
+        block["input"] = _redact_safe_only(block["input"], ruleset)
+    elif block_type == "tool_result" and "content" in block:
+        block["content"] = _redact_safe_only(block["content"], ruleset)
+    return block
+
+
+def _redact_message_content(content, ruleset: RuleSet):
+    if isinstance(content, str):
+        # The simple non-block API shape: always genuine conversational
+        # text, never tool_use/tool_result structure.
+        return redact(content, ruleset, include_scoped=True)
+    if isinstance(content, list):
+        return [_redact_block(block, ruleset) for block in content]
+    return content
+
+
+def redact_request_body(body_text: str, ruleset: RuleSet) -> str:
+    """Redact an Anthropic Messages API request body with structural
+    awareness, instead of treating the whole JSON payload as one text
+    blob. This is the fix for a real incident (see THREAT_MODEL.md):
+    the API resends full conversation history on every turn, and tool
+    results are wrapped in role: "user" messages by convention even
+    though their content is real tool execution output, not
+    human-authored text. A blind full-body regex substitution applies
+    scope: user-text-only rules (client-name/region-token style
+    rewrites) to that real tool output just as readily as to genuine
+    prose -- rewriting a real path the model had just seen from `pwd`
+    or `ls`, so its next Bash command (mkdir, cd) targeted a fake path
+    that didn't exist on disk.
+
+    Falls back to the old structure-blind redact() over the whole body
+    if it isn't valid JSON or doesn't look like a Messages API request
+    (no "messages" list) -- so an unexpected body shape still gets the
+    safe rules applied, rather than none."""
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, TypeError):
+        return redact(body_text, ruleset)
+
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        return redact(body_text, ruleset)
+
+    for message in data["messages"]:
+        if not isinstance(message, dict) or "content" not in message:
+            continue
+        message["content"] = _redact_message_content(message["content"], ruleset)
+
+    if isinstance(data.get("system"), str):
+        data["system"] = redact(data["system"], ruleset, include_scoped=True)
+
+    return json.dumps(data)
 
 
 def restore(text: str, mapping: dict) -> str:

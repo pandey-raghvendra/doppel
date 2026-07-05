@@ -39,13 +39,14 @@ WHY THIS EXISTS (context if you're new to this file)
   to create a stray directory on disk. See THREAT_MODEL.md.
 
   Client-name/region-token style rules are still opt-in rather than
-  on by default: applying them to resent conversation history (which
-  includes real Bash tool output, not just user-authored text) is
-  what caused the stray-directory incident above. Widening the
-  restore hook to Bash mitigates the consequence, but doesn't stop
-  the model's view of history from drifting in the first place. See
-  the comments in .redaction_rules if you want to enable name-level
-  redaction -- understand that tradeoff first.
+  on by default. The root cause of the stray-directory incident is
+  now fixed: the proxy redacts requests with awareness of Messages
+  API structure (redact_request_body() in core.py) and only applies a
+  rule marked "scope: user-text-only" to genuine text content, never
+  to tool_use/tool_result blocks -- which is where the real Bash
+  output that got rewritten actually lived, even though the API wraps
+  it in a role: "user" message. See the comments in .redaction_rules
+  for how to enable name-level redaction with that scope set.
 """
 import argparse
 import json
@@ -53,7 +54,7 @@ import socket
 import sys
 from pathlib import Path
 
-from redactctl.core import MappingStore, RuleError, RuleSet, redact, restore, warm_presidio
+from redactctl.core import MappingStore, RuleError, RuleSet, redact, redact_request_body, restore, warm_presidio
 
 RULES_PATH = Path(".redaction_rules")
 MAP_PATH = Path(".redaction_map.json")
@@ -88,24 +89,30 @@ DEFAULT_RULES = """rules:
     replacement: 'dev.azure.com/redacted-org'
     category: HOST
 
-  # DISABLED BY DEFAULT -- see module docstring above for why.
-  # Redacting names/tokens that also appear in filesystem paths
-  # caused Claude to lose track of its real working directory across
-  # turns, because this proxy redacts the full resent conversation
-  # history on every request, not just the newest message. Re-enable
-  # only if you understand that risk, or if you're not using Claude
-  # Code's Bash/file tools against paths containing these values.
+  # DISABLED BY DEFAULT -- see module docstring above for why. The
+  # "scope: user-text-only" line below is the fix that makes these
+  # safe to enable: the proxy now redacts request bodies with
+  # awareness of Messages API structure (see redact_request_body() in
+  # core.py) and only applies scope: user-text-only rules to "text"
+  # content blocks, never to tool_use/tool_result blocks -- which is
+  # where the real Bash output (a real `pwd`/`ls` path) that caused
+  # the original stray-directory incident actually lived. Without
+  # "scope: user-text-only" a rule still applies everywhere, same as
+  # before this fix -- so leaving it off is still the historically
+  # risky configuration.
   #
   # - id: client-name
   #   pattern: '(?i)Lockton'
   #   replacement: 'ClientCorp'
   #   real_value: 'Lockton'
   #   category: PROJECT
+  #   scope: user-text-only
   #
   # - id: mx-region-token
   #   pattern: '(?i)([-_])mx([-_])'
   #   replacement: '${1}xx${2}'
   #   category: PROJECT
+  #   scope: user-text-only
 
   # DISABLED BY DEFAULT -- requires `pip install presidio-analyzer spacy`
   # plus `python -m spacy download en_core_web_sm`. NER-based, not
@@ -400,7 +407,7 @@ def cmd_start(args):
         body_bytes = await request.body()
         try:
             body_text = body_bytes.decode("utf-8")
-            redacted_bytes = redact(body_text, ruleset).encode("utf-8")
+            redacted_bytes = redact_request_body(body_text, ruleset).encode("utf-8")
         except UnicodeDecodeError:
             redacted_bytes = body_bytes
 

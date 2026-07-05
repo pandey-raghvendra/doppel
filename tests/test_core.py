@@ -9,7 +9,7 @@ import re
 import pytest
 
 from redactctl.core import (
-    RuleSet, MappingStore, redact, restore,
+    RuleSet, MappingStore, redact, redact_request_body, restore,
     fake_ip, fake_guid, convert_backreference_syntax, RuleError,
 )
 
@@ -120,7 +120,7 @@ def test_single_bad_rule_does_not_crash_whole_redaction():
     # in a future rule without needing YAML gymnastics.
     def exploding_replacer(m):
         raise RuntimeError("simulated bug in a rule")
-    ruleset.rules.append(("exploding", re.compile("trigger"), exploding_replacer))
+    ruleset.rules.append(("exploding", re.compile("trigger"), exploding_replacer, "all"))
 
     text = "id = \"323141ce-56db-43a4-a7fb-6e491d10ddd6\" trigger"
     result = redact(text, ruleset)  # must not raise
@@ -152,12 +152,133 @@ def test_name_rules_do_rewrite_path_like_strings_this_is_a_known_risk():
     path = "/Users/dev/lockton-mx/terraform/main.tf"
     result = redact(path, ruleset)
     assert result != path, (
-        "This is EXPECTED given the rule -- but a rule like this must "
-        "never be applied to resent conversation history for an "
-        "agentic tool, only to genuinely new content. See "
-        "THREAT_MODEL.md 'Path drift' section before enabling any "
-        "rule like this in a live proxy."
+        "This is EXPECTED given a plain redact() call with no scoping -- "
+        "which is exactly why redact_request_body() exists now (see "
+        "the tests below and THREAT_MODEL.md 'Path drift' section): a "
+        "rule like this must set scope: user-text-only and be applied "
+        "through redact_request_body(), never as a raw redact() call "
+        "over resent conversation history for an agentic tool."
     )
+
+
+# ---------------------------------------------------------------------
+# INCIDENT (root fix): the proxy redacted the ENTIRE request body as one
+# text blob, including resent tool_result content (real Bash stdout,
+# e.g. a real path from `pwd`). A scope: user-text-only rule doesn't
+# know the difference between that and genuine prose, so it rewrote
+# the real path -- and Claude's next command (mkdir, cd) targeted the
+# rewritten, nonexistent path. redact_request_body() fixes this by
+# only applying scope: user-text-only rules to "text" content blocks,
+# never to tool_use/tool_result blocks -- notably NOT based on the
+# enclosing message's role, since the Messages API wraps tool results
+# in role: "user" messages by convention even though the content is
+# 100% tool output, not human-authored text.
+# ---------------------------------------------------------------------
+
+CLIENT_NAME_RULE = {
+    "id": "client-name",
+    "pattern": r"(?i)Lockton",
+    "replacement": "ClientCorp",
+    "real_value": "Lockton",
+    "category": "PROJECT",
+    "scope": "user-text-only",
+}
+
+
+def test_redact_include_scoped_false_skips_scoped_rules():
+    ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]})
+    text = "the lockton-mx project"
+    assert redact(text, ruleset, include_scoped=True) != text
+    assert redact(text, ruleset, include_scoped=False) == text, (
+        "scope: user-text-only rules must be skippable for tool-originated content"
+    )
+
+
+def test_redact_request_body_protects_tool_result_but_redacts_text_blocks(mapping_store):
+    """The exact failure mode from the incident: a real path appears
+    both in a genuine user text block and in a tool_result block (as
+    if echoed back from a prior `pwd`). Only the text block's copy may
+    be rewritten by the scope: user-text-only rule."""
+    ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE, GUID_RULE]}, mapping_store)
+    real_path = "/Users/dev/lockton-mx/terraform"
+    body = {
+        "model": "claude-x",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": f"please check {real_path}"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": real_path},
+            ]},
+        ],
+    }
+    result = json.loads(redact_request_body(json.dumps(body), ruleset))
+
+    text_block = result["messages"][0]["content"][0]["text"]
+    tool_result_block = result["messages"][2]["content"][0]["content"]
+
+    assert "lockton-mx" not in text_block, "genuine text content must still get scoped rules"
+    assert tool_result_block == real_path, (
+        "tool_result content must be left untouched by scope: user-text-only rules, "
+        "even though the Messages API wraps it in a role: 'user' message"
+    )
+
+
+def test_redact_request_body_still_applies_safe_rules_inside_tool_result(mapping_store):
+    """Being exempt from scope: user-text-only rules doesn't mean
+    tool_result/tool_use content is unprotected -- GUID/IP/PRESIDIO
+    rules (pure value substitution, safe regardless of block type)
+    must still apply there."""
+    ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE, GUID_RULE]}, mapping_store)
+    body = {
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": 'echo "323141ce-56db-43a4-a7fb-6e491d10ddd6"'}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "323141ce-56db-43a4-a7fb-6e491d10ddd6"},
+            ]},
+        ],
+    }
+    result = json.loads(redact_request_body(json.dumps(body), ruleset))
+    tool_use_input = result["messages"][0]["content"][0]["input"]["command"]
+    tool_result_content = result["messages"][1]["content"][0]["content"]
+
+    assert "323141ce" not in tool_use_input
+    assert "323141ce" not in tool_result_content
+    # the SAME real GUID in both places must still map to the same fake
+    mapping = mapping_store.load()
+    restored_input = restore(tool_use_input, mapping)
+    restored_result = restore(tool_result_content, mapping)
+    assert "323141ce-56db-43a4-a7fb-6e491d10ddd6" in restored_input
+    assert "323141ce-56db-43a4-a7fb-6e491d10ddd6" in restored_result
+
+
+def test_redact_request_body_handles_plain_string_content(mapping_store):
+    """The simpler, non-block Messages API shape (message.content as a
+    plain string) is always genuine conversational text."""
+    ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]}, mapping_store)
+    body = {"messages": [{"role": "user", "content": "the lockton-mx project"}]}
+    result = json.loads(redact_request_body(json.dumps(body), ruleset))
+    assert "lockton-mx" not in result["messages"][0]["content"]
+
+
+def test_redact_request_body_falls_back_for_non_messages_shape(mapping_store):
+    """A body that isn't valid JSON, or doesn't have a 'messages' list,
+    must still get the safe rules applied via the old whole-body pass
+    -- not silently skipped entirely."""
+    ruleset = RuleSet.from_yaml_data({"rules": [GUID_RULE]}, mapping_store)
+
+    not_json = 'id = "323141ce-56db-43a4-a7fb-6e491d10ddd6"'
+    assert "323141ce" not in redact_request_body(not_json, ruleset)
+
+    no_messages_key = json.dumps({"foo": "323141ce-56db-43a4-a7fb-6e491d10ddd6"})
+    assert "323141ce" not in redact_request_body(no_messages_key, ruleset)
 
 
 # ---------------------------------------------------------------------

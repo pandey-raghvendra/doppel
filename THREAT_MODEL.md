@@ -94,37 +94,53 @@ negligible for this use case). Covered by
 `test_distinct_guids_get_distinct_fakes` and
 `test_same_guid_gets_same_fake_every_time`.
 
-### 4. Redacting resent conversation history causes agent state drift (mitigated, not fully solved)
+### 4. Redacting resent conversation history causes agent state drift (fixed)
 
 **What happened:** This is the most serious failure found. The proxy
-redacts the full outbound request body on every call -- which
-includes the *entire resent conversation history* on multi-turn
-agent sessions, not just the newest message. A rule rewriting a
-client name that also appeared inside filesystem paths caused Claude
-to lose track of its own actual working directory across turns. It
-then ran a `find` command against a path it incorrectly "remembered"
-from its own redacted history, and a stray directory was created on
-disk at that fabricated path.
+redacted the full outbound request body on every call as one text
+blob -- which includes the *entire resent conversation history* on
+multi-turn agent sessions, not just the newest message, and includes
+real tool execution output (Bash stdout), not just user-authored
+text. A rule rewriting a client name that also appeared inside
+filesystem paths caused Claude to lose track of its own actual
+working directory across turns. It then ran a `find`/`mkdir` command
+against a path it incorrectly "remembered" from its own redacted
+history, and a stray directory was created on disk at that fabricated
+path.
 
-**Why this is worse than the other bugs:** It doesn't fail loudly. It
-produces plausible-looking, confidently-stated wrong output, and can
-cause real side effects (file/directory creation) before anyone
-notices the underlying state has diverged from reality.
+**Why this was worse than the other bugs:** It didn't fail loudly. It
+produced plausible-looking, confidently-stated wrong output, and
+caused real side effects (file/directory creation) before anyone
+noticed the underlying state had diverged from reality.
 
-**Current mitigation:** Name/path-like rules (client name, region
-tokens) are **disabled by default**. Only value-level rules (GUIDs,
-IPs) that don't plausibly appear as filesystem path components are
-enabled out of the box. See `test_name_rules_do_rewrite_path_like_strings_this_is_a_known_risk`
-for the mechanical confirmation of the risk.
+**First mitigation (partial):** The restore hook was widened from
+Write/Edit to also cover Bash `command`, so even if the model's view
+drifted and it referenced a fake path, the real value was substituted
+back in before the shell executed it. This stopped the consequence
+but not the underlying cause: the model's *belief* about its own
+history could still silently diverge from reality.
 
-**Not yet solved:** The correct fix is redacting only the *newest*
-turn in each request, not the full resent history, so an agent's
-memory of its own prior actions stays internally consistent turn over
-turn. This requires diffing each request against the previous one to
-identify what's actually new -- meaningfully more complex than the
-current whole-body approach, and not yet implemented. Anyone enabling
-name/path-level rules before this is fixed should expect the same
-class of bug to recur.
+**Root fix:** `redact_request_body()` in `core.py` parses the
+Messages API request structurally instead of treating it as one text
+blob. A key subtlety: the API wraps tool results in `role: "user"`
+messages by convention (it's simply "your turn" framing), so a
+naive role-based check would still misclassify real tool output as
+safe user text. The actual distinction that matters is **block
+type**: only `"text"` content blocks (genuine prose, whether
+human-typed or model-generated) get rules marked `scope:
+user-text-only` in `.redaction_rules`; `tool_use`/`tool_result`
+blocks -- which carry real command arguments and real command
+output -- only ever get the safe, value-level rules (GUID/IP/PRESIDIO),
+never a rule that rewrites a fragment of an identifier. Falls back to
+the old whole-body regex pass if a request body isn't valid JSON or
+doesn't look like a Messages API request, so unexpected shapes still
+get the safe rules rather than none.
+
+Covered by tests exercising `redact_request_body()` directly with a
+simulated request containing a `tool_result` block holding a real
+path alongside a `scope: user-text-only` rule, confirming the
+tool_result content is left untouched while a genuine `text` block
+with the same content would be rewritten.
 
 ### 5. Single point of failure: the mapping file
 

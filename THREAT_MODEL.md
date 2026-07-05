@@ -186,7 +186,7 @@ map file and its `.lock` sidecar).
 ### 6. Leak paths found in a dedicated review (July 2026)
 
 A leak-focused audit of the whole pipeline (rather than incident
-response) found four ways sensitive data could still reach the API.
+response) found five ways sensitive data could still reach the API.
 All are fixed; listed here because each one is a lesson about where
 this class of tool goes wrong.
 

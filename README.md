@@ -95,4 +95,20 @@ genuine text content, never to `tool_use`/`tool_result` blocks. See
 
 - Python 3.9+ for core CLI/proxy (`pyyaml`, `fastapi`, `uvicorn`, `httpx`)
 - Python 3.10+ for the optional Presidio rule category (`presidio-analyzer`,
-  `spacy`, plus a spaCy model: `python -m spacy download en_core_web_sm`)
+  `spacy`, plus a spaCy model: `python -m spacy download en_core_web_sm`) --
+  spaCy hard-requires 3.10+, so this can't be installed under Python 3.9
+  regardless of pip flags.
+
+## Running tests
+
+```bash
+pytest tests/
+```
+
+Presidio-gated tests (`@requires_presidio` in `tests/test_core.py`) skip
+cleanly rather than fail if presidio-analyzer/spacy aren't importable --
+by design, so the rest of the suite stays runnable without the heavier
+optional dependency. If your default `python3` is 3.9, create a Python
+3.10+ virtualenv with `presidio-analyzer`, `spacy`, and `en_core_web_sm`
+installed (see Requirements above) and run pytest from there to get full
+coverage instead of skips.

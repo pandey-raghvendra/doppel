@@ -112,3 +112,7 @@ optional dependency. If your default `python3` is 3.9, create a Python
 3.10+ virtualenv with `presidio-analyzer`, `spacy`, and `en_core_web_sm`
 installed (see Requirements above) and run pytest from there to get full
 coverage instead of skips.
+
+## License
+
+[MIT](LICENSE)

@@ -148,18 +148,32 @@ The `.redaction_map.json` file is the only record of which fake value
 corresponds to which real one. It:
 
 - Is plain JSON, unencrypted, containing real subscription IDs and IPs
-  in cleartext, on local disk.
-- Has no locking across separate OS processes (only within a single
-  Python process via a threading lock) -- concurrent writes from two
-  separate proxy instances could interleave incorrectly.
+  in cleartext, on local disk. **Not fixed** -- doing so properly needs
+  a real key source (OS keychain integration, or a passphrase prompt),
+  which is a design decision, not a quick patch. Treat this file as
+  sensitive as the real values it maps to, because it functionally is.
 - If lost or corrupted, previously-redacted values become permanently
   unrestorable -- any file Claude already wrote referencing a fake
   value cannot be automatically fixed after the fact.
 
-**Mitigation:** Add `.redaction_map.json` to `.gitignore` (done by
-`init`). Do not run two proxy instances against the same project
-directory concurrently. Treat this file as sensitive as the real
-values it maps to, because it functionally is.
+**Cross-process locking (fixed):** `MappingStore` used to hold only an
+in-process `threading.Lock` around its load -> modify -> write cycle,
+which does nothing for two separate OS processes -- the proxy and a
+restore-hook invocation, or two concurrent hook invocations, could race
+and one process's update would silently overwrite the other's. Every
+mutation now also holds an exclusive `fcntl.flock` on a
+`.redaction_map.json.lock` sidecar file for the full cycle, so a second
+writer blocks until the first finishes. POSIX-only (macOS/Linux); on
+platforms without `fcntl` this falls back to the old in-process-only
+behavior. Covered by
+`test_mapping_store_survives_concurrent_writes_from_separate_instances`,
+which uses a fresh `MappingStore` per worker (so each has its own,
+always-uncontended `threading.Lock`) to force the race to be caught
+only by the OS-level lock.
+
+**Mitigation (for the remaining cleartext risk):** Add
+`.redaction_map.json*` to `.gitignore` (done by `init`, covers both the
+map file and its `.lock` sidecar).
 
 ## Reporting a new failure mode
 

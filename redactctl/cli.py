@@ -254,7 +254,7 @@ def cmd_init(args):
             print(f"[redactctl] wired restore hook into {SETTINGS_PATH}")
 
     gitignore = Path(".gitignore")
-    entry = ".redaction_map.json"
+    entry = ".redaction_map.json*"  # covers both the map file and its .lock sidecar
     if gitignore.exists():
         content = gitignore.read_text()
         if entry not in content:

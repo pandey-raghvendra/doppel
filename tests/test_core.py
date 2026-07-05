@@ -314,6 +314,47 @@ def test_mapping_store_persists_across_separate_instances(tmp_path):
     assert reader.load() == {"fake-value": "real-value"}
 
 
+# ---------------------------------------------------------------------
+# FIX: save_pair()/save_pair_avoiding_collision() used to only hold an
+# in-process threading.Lock around the load -> modify -> write cycle.
+# That does nothing for two separate OS processes (the proxy and a
+# restore-hook invocation, or two concurrent hook invocations) writing
+# to the same mapping file -- one process's update could silently
+# overwrite the other's. Fixed with an OS-level fcntl.flock on a
+# sidecar .lock file held for the full cycle.
+# ---------------------------------------------------------------------
+
+def test_mapping_store_survives_concurrent_writes_from_separate_instances(tmp_path):
+    """Each worker gets its OWN MappingStore instance (own, always-
+    uncontended threading.Lock) to simulate separate processes that
+    don't share in-process state -- only the flock on the file itself
+    can prevent a lost update here."""
+    import threading
+
+    path = tmp_path / ".redaction_map.json"
+    errors = []
+
+    def worker(n):
+        try:
+            store = MappingStore(path)
+            for i in range(20):
+                store.save_pair(f"fake-{n}-{i}", f"real-{n}-{i}")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    mapping = MappingStore(path).load()
+    assert len(mapping) == 8 * 20, (
+        "a lost update means the cross-process lock isn't actually preventing the race"
+    )
+
+
 def test_restore_handles_overlapping_fake_values_longest_first(mapping_store):
     """A short fake value that happens to be a substring of a longer
     one must not corrupt the longer match during restoration."""

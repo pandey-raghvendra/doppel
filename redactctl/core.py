@@ -10,6 +10,11 @@ import re
 import threading
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX only -- see MappingStore._locked_read_modify_write
+except ImportError:
+    fcntl = None
+
 
 class RuleError(Exception):
     """Raised when a rule fails to parse. Callers decide whether to
@@ -28,14 +33,21 @@ def convert_backreference_syntax(replacement: str) -> str:
 
 class MappingStore:
     """Persists fake->real value mappings so a separate process (the
-    restore hook) can reverse a proxy's substitutions. Thread-safe
-    for concurrent access within one process; not safe across
-    multiple processes writing simultaneously, which is an accepted
-    limitation for a single local dev session (see THREAT_MODEL.md)."""
+    restore hook) can reverse a proxy's substitutions.
+
+    Safe across both threads AND separate OS processes: the proxy and
+    a restore-hook invocation (or two concurrent hook invocations) are
+    different processes, and a threading.Lock alone does nothing to
+    stop them from racing on the same load -> modify -> write cycle --
+    one process's update could silently overwrite the other's. Every
+    mutation holds an exclusive fcntl.flock on a sidecar lock file for
+    the full cycle, so a second process blocks until the first
+    finishes instead of interleaving."""
 
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.Lock()
+        self._lock_path = path.with_suffix(path.suffix + ".lock")
 
     def load(self) -> dict:
         if not self.path.exists():
@@ -45,33 +57,54 @@ class MappingStore:
         except (json.JSONDecodeError, OSError):
             return {}
 
-    def save_pair(self, fake: str, real: str):
+    def _locked_read_modify_write(self, mutate_fn):
+        """Hold self._lock (in-process) AND an OS-level exclusive lock
+        on a sidecar .lock file (cross-process) for the full
+        load -> mutate_fn(mapping) -> write cycle. mutate_fn mutates
+        `mapping` in place and may return a value to hand back to the
+        caller. On platforms without fcntl (non-POSIX), falls back to
+        the threading.Lock alone -- same limitation this class used to
+        have everywhere, now scoped to just those platforms."""
         with self._lock:
-            mapping = self.load()
+            if fcntl is None:
+                mapping = self.load()
+                result = mutate_fn(mapping)
+                self.path.write_text(json.dumps(mapping, indent=2))
+                return result
+            with open(self._lock_path, "a+") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                try:
+                    mapping = self.load()
+                    result = mutate_fn(mapping)
+                    self.path.write_text(json.dumps(mapping, indent=2))
+                    return result
+                finally:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def save_pair(self, fake: str, real: str):
+        def mutate(mapping):
             mapping[fake] = real
-            self.path.write_text(json.dumps(mapping, indent=2))
+        self._locked_read_modify_write(mutate)
 
     def save_pair_avoiding_collision(self, real: str, generator, max_attempts: int = 1000) -> str:
         """Record real -> fake using `generator(real, salt)` to produce
         candidate fakes, retrying with an incrementing salt if a
         candidate is already mapped to a DIFFERENT real value.
 
-        save_pair() alone stores fake->real as a plain dict key, so if
-        two distinct real values ever hash to the same fake, the
-        second save silently overwrites the first -- both real values
-        then restore to whichever was saved last, and the first is
-        permanently unrecoverable. This is the fix for that: never
-        overwrite an existing fake that belongs to a different real
-        value, generate an alternate instead."""
-        with self._lock:
-            mapping = self.load()
+        A plain fake->real dict write alone means that if two distinct
+        real values ever hash to the same fake, the second save
+        silently overwrites the first -- both real values then restore
+        to whichever was saved last, and the first is permanently
+        unrecoverable. This is the fix for that: never overwrite an
+        existing fake that belongs to a different real value, generate
+        an alternate instead."""
+        def mutate(mapping):
             salt = 0
             while True:
                 fake = generator(real, salt)
                 existing = mapping.get(fake)
                 if existing is None or existing == real:
                     mapping[fake] = real
-                    self.path.write_text(json.dumps(mapping, indent=2))
                     return fake
                 salt += 1
                 if salt > max_attempts:
@@ -79,8 +112,8 @@ class MappingStore:
                     # Accept the collision rather than loop forever;
                     # still better than crashing the whole request.
                     mapping[fake] = real
-                    self.path.write_text(json.dumps(mapping, indent=2))
                     return fake
+        return self._locked_read_modify_write(mutate)
 
 
 def fake_ip(real_value: str, salt: int = 0) -> str:

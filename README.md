@@ -105,7 +105,10 @@ The map/rules files themselves are guarded in three layers: Claude
 Code `permissions.deny` entries, hook-level denial of read-capable
 tools referencing them, and — the actual wall — an outbound leak guard
 that scrubs every known real value from request bodies regardless of
-how it resurfaced (verified at wire level). See
+how it resurfaced (verified at wire level). That same wire testing
+also caught fake GUIDs/IPs re-entering a request and getting re-faked
+a second time; redaction is now idempotent — an already-issued fake is
+returned unchanged instead of being faked again. See
 [`THREAT_MODEL.md`](THREAT_MODEL.md) for the full incident history and
 residual risks.
 

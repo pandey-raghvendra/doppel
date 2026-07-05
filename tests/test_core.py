@@ -10,6 +10,7 @@ import pytest
 
 from redactctl.core import (
     RuleSet, MappingStore, redact, redact_request_body, restore,
+    scrub_known_real_values,
     fake_ip, fake_guid, convert_backreference_syntax, RuleError,
 )
 
@@ -330,6 +331,56 @@ def test_redact_request_body_redacts_tools_and_metadata_with_safe_rules(mapping_
 
 
 # ---------------------------------------------------------------------
+# LEAK GUARD: rule-based redaction has deliberate holes (scoped rules
+# skip tool blocks), and content can resurface through paths no rule
+# anticipates -- canonically, the agent cat'ing .redaction_map.json
+# itself, whose real values then arrive inside a tool_result.
+# scrub_known_real_values() is the outbound backstop: anything the
+# mapping store has ever recorded as real must never leave, no matter
+# how it got back into a request.
+# ---------------------------------------------------------------------
+
+def test_scrub_replaces_known_real_values_with_their_existing_fakes():
+    mapping = {"ClientCorp": "Lockton", "10.99.1.5": "10.20.30.40"}
+    text = "the map says Lockton lives at 10.20.30.40"
+    result = scrub_known_real_values(text, mapping)
+    assert "Lockton" not in result
+    assert "10.20.30.40" not in result
+    assert "ClientCorp" in result and "10.99.1.5" in result, (
+        "must reuse the EXISTING fakes so the model's view stays consistent"
+    )
+
+
+def test_scrub_longest_real_value_first():
+    """A real value that is a substring of a longer one must not
+    corrupt the longer match -- same property restore() has, inverted."""
+    mapping = {"fake-a": "10.0.0.1", "fake-b": "10.0.0.100"}
+    result = scrub_known_real_values("x=10.0.0.1 y=10.0.0.100", mapping)
+    assert result == "x=fake-a y=fake-b"
+
+
+def test_scrub_catches_map_contents_leaking_through_tool_result(mapping_store):
+    """The end-to-end scenario the guard exists for: a name-level real
+    value (scoped rules deliberately skip tool blocks) arrives inside a
+    tool_result -- as if the agent just cat'ed the mapping file -- and
+    must still be scrubbed from the outbound body."""
+    ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]}, mapping_store)
+    # The scoped rule records its pair when the ruleset is built.
+    assert mapping_store.load() == {"ClientCorp": "Lockton"}
+
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": '{"ClientCorp": "Lockton"}'},  # cat .redaction_map.json output
+    ]}]}
+    after_rules = redact_request_body(json.dumps(body), ruleset)
+    assert "Lockton" in after_rules, (
+        "precondition: scoped rules leave tool_result alone, so the leak exists"
+    )
+    after_scrub = scrub_known_real_values(after_rules, mapping_store.load())
+    assert "Lockton" not in after_scrub, "the outbound guard must close it"
+
+
+# ---------------------------------------------------------------------
 # INCIDENT (review finding): the Presidio pass ran regardless of
 # include_scoped, so PERSON/LOCATION rewriting -- name-level redaction
 # by definition -- still applied to tool_result content, reproducing
@@ -497,6 +548,20 @@ def test_collision_avoidance_keeps_both_real_values_recoverable(mapping_store):
     assert fake_a != fake_b, "colliding fakes must be disambiguated, not silently merged"
     mapping = mapping_store.load()
     assert restore(f"a={fake_a} b={fake_b}", mapping) == "a=10.0.0.1 b=10.0.0.2"
+
+
+def test_already_issued_fake_is_never_re_faked(mapping_store):
+    """Fake GUIDs/IPs are shaped like real ones, so a fake re-entering
+    a request (model echoing it back, redacted content flowing through
+    a tool) matches the same rule that created it. Re-faking it builds
+    a fake->fake chain whose restore depends on dict iteration order --
+    found live in wire testing, not hypothetical."""
+    ruleset = RuleSet.from_yaml_data({"rules": [GUID_RULE]}, mapping_store)
+    original = 'id = "323141ce-56db-43a4-a7fb-6e491d10ddd6"'
+    redacted_once = redact(original, ruleset)
+    redacted_twice = redact(redacted_once, ruleset)
+    assert redacted_twice == redacted_once, "redaction must be idempotent"
+    assert restore(redacted_twice, mapping_store.load()) == original
 
 
 def test_collision_avoidance_reuses_fake_for_the_same_real_value(mapping_store):

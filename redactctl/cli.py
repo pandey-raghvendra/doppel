@@ -71,7 +71,10 @@ import socket
 import sys
 from pathlib import Path
 
-from redactctl.core import MappingStore, RuleError, RuleSet, redact, redact_request_body, restore, warm_presidio
+from redactctl.core import (
+    MappingStore, RuleError, RuleSet, redact, redact_request_body, restore,
+    scrub_known_real_values, warm_presidio,
+)
 
 RULES_PATH = Path(".redaction_rules")
 MAP_PATH = Path(".redaction_map.json")
@@ -399,6 +402,14 @@ def _restore_value(value, mapping: dict):
     return value
 
 
+# Tools that can get file contents into the conversation. Write/Edit
+# are deliberately absent: merely MENTIONING a protected filename in
+# written content (a .gitignore line, a README) is harmless and must
+# not be blocked.
+_READ_CAPABLE_TOOLS = {"Read", "Bash", "Grep", "Glob", "NotebookRead"}
+_PROTECTED_FILE_TOKENS = (".redaction_map.json", ".redaction_rules")
+
+
 def cmd_restore_hook(args):
     raw = sys.stdin.read()
     try:
@@ -408,6 +419,35 @@ def cmd_restore_hook(args):
         return
 
     tool_input = event.get("tool_input", {})
+    tool_name = event.get("tool_name", "")
+
+    # Deny read-capable tools that reference the rules/map files. Their
+    # contents (real_value fields, the entire fake->real map, name-rule
+    # patterns) are the secrets themselves; once read, they enter a
+    # tool_result where name-level rules deliberately don't apply.
+    # Best-effort -- an indirect read (command substitution, a glob the
+    # string check can't see) slips past this, which is why the proxy
+    # also scrubs every known real value from outbound bodies. Checked
+    # before the empty-mapping early-exit: .redaction_rules contains
+    # real values even when no mapping entries exist yet.
+    if tool_name in _READ_CAPABLE_TOOLS:
+        serialized_input = json.dumps(tool_input)
+        if any(token in serialized_input for token in _PROTECTED_FILE_TOKENS):
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "redactctl: this file contains the real values behind the "
+                        "redaction (fake->real mapping / rule definitions). Reading "
+                        "it would leak them into the conversation. It is managed by "
+                        "redactctl -- ask the user directly if you need to know "
+                        "what is being redacted."
+                    ),
+                }
+            }))
+            return
+
     mapping = _mapping_store.load()
 
     if not mapping:
@@ -514,7 +554,16 @@ def cmd_start(args):
                                      "refusing to forward it unredacted (fail-closed). "
                                      "Disable request compression/binary encoding and retry."}
             })
-        redacted_bytes = redact_request_body(body_text, ruleset).encode("utf-8")
+        redacted_text = redact_request_body(body_text, ruleset)
+        # Outbound leak guard: anything the mapping store has ever
+        # recorded as a real value must not leave, even if it resurfaced
+        # through a path the rules deliberately skip (e.g. the agent
+        # cat'ing .redaction_map.json -- its contents arrive inside a
+        # tool_result, where name-level rules don't apply). Loaded per
+        # request so pairs recorded moments ago by this same body's
+        # rule pass are included.
+        redacted_text = scrub_known_real_values(redacted_text, _mapping_store.load())
+        redacted_bytes = redacted_text.encode("utf-8")
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_REQUEST_HEADERS}
         url = f"{UPSTREAM}/{path}"

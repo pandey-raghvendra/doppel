@@ -99,8 +99,15 @@ name-level rewriting to tool output (now scoped like the regex rules);
 and a Presidio failure was silently swallowed (now logged). `init` also
 denies the agent Read access to `.redaction_rules`/`.redaction_map.json`,
 and `start` refuses to run as a zero-rule passthrough without
-`--allow-no-rules`. See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the full
-incident history and residual risks.
+`--allow-no-rules`.
+
+The map/rules files themselves are guarded in three layers: Claude
+Code `permissions.deny` entries, hook-level denial of read-capable
+tools referencing them, and — the actual wall — an outbound leak guard
+that scrubs every known real value from request bodies regardless of
+how it resurfaced (verified at wire level). See
+[`THREAT_MODEL.md`](THREAT_MODEL.md) for the full incident history and
+residual risks.
 
 ## Requirements
 

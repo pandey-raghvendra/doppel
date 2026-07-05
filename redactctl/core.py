@@ -98,8 +98,20 @@ class MappingStore:
         to whichever was saved last, and the first is permanently
         unrecoverable. This is the fix for that: never overwrite an
         existing fake that belongs to a different real value, generate
-        an alternate instead."""
+        an alternate instead.
+
+        If `real` is itself an already-issued fake, it's returned
+        unchanged: fake GUIDs/IPs are shaped like real ones, so a fake
+        that re-enters a request (model echoing it, redacted content
+        flowing back through a tool) matches the same rules that made
+        it -- re-faking it builds fake->fake chains whose restoration
+        depends on dict iteration order (seen live in wire testing:
+        a fake GUID inside a tool_result got re-redacted to a second-
+        generation fake)."""
         def mutate(mapping):
+            if real in mapping:
+                # Already one of our fakes -- leave it alone.
+                return real
             salt = 0
             while True:
                 fake = generator(real, salt)
@@ -527,6 +539,29 @@ def redact_request_body(body_text: str, ruleset: RuleSet) -> str:
             data[key] = _redact_safe_only(data[key], ruleset)
 
     return json.dumps(data)
+
+
+def scrub_known_real_values(text: str, mapping: dict) -> str:
+    """Outbound leak guard: replace any KNOWN real value (anything the
+    mapping store has ever recorded) that survived rule-based redaction
+    with its existing fake. restore() run in reverse, effectively.
+
+    This exists because rule-based redaction has deliberate holes --
+    scope: user-text-only rules skip tool blocks, and content can reach
+    the request through paths no rule anticipates (the canonical case:
+    the agent cat'ing .redaction_map.json itself, whose real values
+    then arrive inside a tool_result). The rules decide what LOOKS
+    sensitive; this pass guarantees that values already PROVEN
+    sensitive never leave, no matter how they resurfaced.
+
+    Exact-string matching only: 'Lockton' in the map won't catch a
+    'lockton' the case-insensitive rule would have -- this is a
+    backstop for known values, not a second rule engine. Longest real
+    values first, same substring-corruption logic as restore()."""
+    for fake, real in sorted(mapping.items(), key=lambda kv: len(kv[1]), reverse=True):
+        if real in text:
+            text = text.replace(real, fake)
+    return text
 
 
 def restore(text: str, mapping: dict) -> str:

@@ -222,19 +222,43 @@ spaCy failed mid-session, every subsequent request shipped PII with
 only regex coverage and zero indication. Still fails open for
 availability, but now prints a WARNING per affected text.
 
-**6e. The rules and map files are readable by the agent (mitigated).**
-`.redaction_rules` (whose `real_value:` fields and name-rule regex
-patterns literally contain the secrets) and `.redaction_map.json`
-(fake -> real, all of it) sit in the project root. If the agent Reads
-either, the content enters a tool_result block -- where name-level
-rules deliberately don't apply -- and the real values go to the API.
-`init` now adds `permissions.deny` entries for `Read` on all three
-files. **Residual risk:** a Bash `cat`/`grep` of those files is not
-blocked (denying all file-reading shell commands isn't practical);
-value-level secrets self-heal (the GUID/IP rules re-redact them to
-their existing fakes) but name-level secrets would leak. If you use
-name-level rules, consider moving the rules/map out of the project
-tree entirely.
+**6e. The rules and map files are readable by the agent (fixed with
+three layers).** `.redaction_rules` (whose `real_value:` fields and
+name-rule regex patterns literally contain the secrets) and
+`.redaction_map.json` (fake -> real, all of it) sit in the project
+root. If the agent reads either, the content enters a tool_result
+block -- where name-level rules deliberately don't apply -- and the
+real values would go to the API. Three defenses, outermost first:
+
+1. `init` adds `permissions.deny` entries for `Read` on all three
+   files (Claude Code's own permission system).
+2. The restore hook denies read-capable tools (Read, Bash, Grep,
+   Glob, NotebookRead) whose input references the protected
+   filenames, with a reason telling the model to ask the user
+   instead. Best-effort: an indirect read (command substitution, an
+   unanticipated glob) can slip past a string check.
+3. **The outbound leak guard is the actual wall:**
+   `scrub_known_real_values()` runs on every proxy request body after
+   rule-based redaction and replaces any known real value (anything
+   the mapping store has ever recorded) with its existing fake --
+   content-based, so it doesn't care how the value resurfaced.
+   Verified at wire level against a local echo upstream: map contents
+   injected via tool_result left the proxy with every real value
+   replaced by its established fake.
+
+**Residual risk:** the guard is exact-string ("Lockton" in the map
+won't catch a "lockton" the case-insensitive rule would have), and it
+only covers values already recorded in the map. A name-level real
+value that has never been through a rule (rules file edited but proxy
+not restarted, say) isn't in the map yet.
+
+**Related fix found during wire testing:** fake GUIDs/IPs are shaped
+like real ones, so a fake re-entering a request matched the same rule
+that created it and got re-faked -- building fake->fake chains whose
+restoration depended on dict iteration order.
+`save_pair_avoiding_collision()` now returns any already-issued fake
+unchanged, making redaction idempotent
+(`test_already_issued_fake_is_never_re_faked`).
 
 Additionally, `start` now refuses to run with zero rules loaded
 (`--allow-no-rules` overrides) -- a redaction proxy silently running

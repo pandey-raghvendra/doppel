@@ -150,12 +150,30 @@ DEFAULT_RULES = """rules:
   #   threshold: 0.35
 """
 
+# Matcher covers ALL tools, not just Write|Edit|Bash: Claude Code also
+# has Read, Glob, Grep, NotebookEdit, etc., and a fake path in any of
+# their inputs hits the real filesystem unrestored (file-not-found, the
+# model loops confused). The restore hook is a no-op whenever a tool
+# input contains no fake values, so the wide matcher costs nothing.
 DEFAULT_HOOK_ENTRY = {
-    "matcher": "Write|Edit|Bash",
+    "matcher": ".*",
     "hooks": [
         {"type": "command", "command": f"python3 {LAUNCHER_PATH} restore-hook"}
     ],
 }
+
+# Defense-in-depth: .redaction_rules and .redaction_map.json contain
+# real sensitive values (real_value fields, the fake->real map, even
+# the name-rule regex pattern itself). If the agent Reads either, the
+# content enters a tool_result block -- where scope: user-text-only
+# rules deliberately do NOT apply -- and name-level secrets go to the
+# API verbatim. Denying Read on them closes the common path; Bash
+# reads (cat/grep) are a documented residual risk, see THREAT_MODEL.md.
+DENY_READ_ENTRIES = [
+    "Read(./.redaction_rules)",
+    "Read(./.redaction_map.json)",
+    "Read(./.redaction_map.json.lock)",
+]
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +259,8 @@ def cmd_init(args):
         settings = {}
 
     if settings is not None:
+        changed = False
+
         hooks = settings.setdefault("hooks", {})
         pretool = hooks.setdefault("PreToolUse", [])
         already_wired = any(
@@ -250,8 +270,20 @@ def cmd_init(args):
             print(f"[redactctl] restore hook already wired in {SETTINGS_PATH}")
         else:
             pretool.append(DEFAULT_HOOK_ENTRY)
-            SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+            changed = True
             print(f"[redactctl] wired restore hook into {SETTINGS_PATH}")
+
+        deny = settings.setdefault("permissions", {}).setdefault("deny", [])
+        missing_denies = [e for e in DENY_READ_ENTRIES if e not in deny]
+        if missing_denies:
+            deny.extend(missing_denies)
+            changed = True
+            print(f"[redactctl] denied agent Read access to rules/map files in {SETTINGS_PATH}")
+        else:
+            print(f"[redactctl] rules/map Read denies already present in {SETTINGS_PATH}")
+
+        if changed:
+            SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
 
     gitignore = Path(".gitignore")
     entry = ".redaction_map.json*"  # covers both the map file and its .lock sidecar
@@ -448,6 +480,12 @@ def cmd_start(args):
         sys.exit(1)
 
     ruleset = load_ruleset()
+    if not ruleset.rules and not ruleset.presidio_entities and not args.allow_no_rules:
+        print("[redactctl] REFUSING to start: no redaction rules loaded, so this "
+              "would be a passthrough proxy sending everything unredacted.\n"
+              "  Run 'redactctl.py init' first, or pass --allow-no-rules if "
+              "passthrough is genuinely what you want.", file=sys.stderr)
+        sys.exit(1)
 
     app = FastAPI()
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
@@ -460,9 +498,23 @@ def cmd_start(args):
         body_bytes = await request.body()
         try:
             body_text = body_bytes.decode("utf-8")
-            redacted_bytes = redact_request_body(body_text, ruleset).encode("utf-8")
         except UnicodeDecodeError:
-            redacted_bytes = body_bytes
+            # Fail CLOSED. A body we can't decode is a body we can't
+            # redact -- forwarding it raw (what an earlier version did)
+            # silently ships every sensitive value in it upstream, e.g.
+            # if a client ever gzips its request bodies. Rejecting
+            # loudly is the only behavior consistent with this tool's
+            # entire reason to exist.
+            print(f"[redactctl] req#{req_id} REJECTED: body is not UTF-8, "
+                  f"cannot redact -- refusing to forward unredacted", file=sys.stderr)
+            return JSONResponse(status_code=502, content={
+                "type": "error",
+                "error": {"type": "proxy_error",
+                          "message": "redactctl: request body is not UTF-8 text; "
+                                     "refusing to forward it unredacted (fail-closed). "
+                                     "Disable request compression/binary encoding and retry."}
+            })
+        redacted_bytes = redact_request_body(body_text, ruleset).encode("utf-8")
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_REQUEST_HEADERS}
         url = f"{UPSTREAM}/{path}"
@@ -513,6 +565,8 @@ def main():
 
     p_start = sub.add_parser("start", help="Run the redaction proxy")
     p_start.add_argument("--port", type=int, default=8642)
+    p_start.add_argument("--allow-no-rules", action="store_true",
+                         help="Start even with zero redaction rules loaded (passthrough proxy)")
 
     p_status = sub.add_parser("status", help="Check current setup")
     p_status.add_argument("--port", type=int, default=8642)

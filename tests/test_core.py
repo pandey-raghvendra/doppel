@@ -282,6 +282,80 @@ def test_redact_request_body_falls_back_for_non_messages_shape(mapping_store):
 
 
 # ---------------------------------------------------------------------
+# INCIDENT (review finding): "system" was only redacted when it was a
+# plain string -- but Claude Code sends system as a LIST of text blocks
+# (prompt caching requires cache_control markers on blocks), and that
+# list is where CLAUDE.md and project context live. Every agent
+# session's most sensitive content went out completely unredacted.
+# ---------------------------------------------------------------------
+
+def test_redact_request_body_redacts_system_as_block_list(mapping_store):
+    ruleset = RuleSet.from_yaml_data({"rules": [GUID_RULE, CLIENT_NAME_RULE]}, mapping_store)
+    body = {
+        "system": [
+            {"type": "text",
+             "text": 'CLAUDE.md: lockton subscription "323141ce-56db-43a4-a7fb-6e491d10ddd6"',
+             "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    result = json.loads(redact_request_body(json.dumps(body), ruleset))
+    system_block = result["system"][0]
+    assert "323141ce" not in system_block["text"]
+    assert "lockton" not in system_block["text"].lower(), (
+        "system prompt is genuine prose context -- scoped rules apply too"
+    )
+    assert system_block["cache_control"] == {"type": "ephemeral"}, (
+        "cache_control must survive redaction or prompt caching breaks"
+    )
+
+
+def test_redact_request_body_redacts_tools_and_metadata_with_safe_rules(mapping_store):
+    """MCP tool definitions can embed real hostnames/IDs. They get the
+    value-level rules -- but NOT scoped name rules, which could rewrite
+    fragments of tool descriptions the model must match exactly."""
+    ruleset = RuleSet.from_yaml_data({"rules": [GUID_RULE, CLIENT_NAME_RULE]}, mapping_store)
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "query_db", "description":
+                   "Queries lockton db 323141ce-56db-43a4-a7fb-6e491d10ddd6"}],
+        "metadata": {"user_id": "323141ce-56db-43a4-a7fb-6e491d10ddd6"},
+    }
+    result = json.loads(redact_request_body(json.dumps(body), ruleset))
+    assert "323141ce" not in result["tools"][0]["description"]
+    assert "323141ce" not in result["metadata"]["user_id"]
+    assert "lockton" in result["tools"][0]["description"], (
+        "scoped rules must NOT rewrite tool definitions"
+    )
+
+
+# ---------------------------------------------------------------------
+# INCIDENT (review finding): the Presidio pass ran regardless of
+# include_scoped, so PERSON/LOCATION rewriting -- name-level redaction
+# by definition -- still applied to tool_result content, reproducing
+# the exact stray-directory drift class the scoped-rules fix closed
+# (verified live: '/projects/John Smith Consulting/main.tf' became
+# '/projects/Morgan Rivera/main.tf' inside a tool_result).
+# ---------------------------------------------------------------------
+
+def test_presidio_pass_is_skipped_for_tool_content(monkeypatch, mapping_store):
+    import redactctl.core as core_module
+
+    calls = []
+    monkeypatch.setattr(core_module, "redact_presidio",
+                        lambda text, *a, **k: calls.append(text) or text)
+
+    ruleset = RuleSet(
+        [], presidio_entities=["PERSON"], mapping_store=mapping_store,
+    )
+    redact("tool output with John Smith", ruleset, include_scoped=False)
+    assert calls == [], "NER name rewriting must never touch tool_use/tool_result content"
+
+    redact("genuine prose with John Smith", ruleset, include_scoped=True)
+    assert len(calls) == 1, "NER must still run on genuine text content"
+
+
+# ---------------------------------------------------------------------
 # The core value proposition: round-trip correctness. Redact, then
 # restore, must return exactly the original -- this is the property
 # that distinguishes this tool from generic chat-redaction proxies.

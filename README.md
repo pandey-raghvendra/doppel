@@ -89,8 +89,18 @@ done.
 The path-drift issue (redacting resent agent conversation history could
 rewrite real tool output, e.g. a real filesystem path from a prior `pwd`)
 has a root fix: `redact_request_body()` only applies risky rules to
-genuine text content, never to `tool_use`/`tool_result` blocks. See
-[`THREAT_MODEL.md`](THREAT_MODEL.md) for the full incident history.
+genuine text content, never to `tool_use`/`tool_result` blocks.
+
+A dedicated leak audit (July 2026) closed four further gaps: `system`
+sent as a content-block list (Claude Code's actual shape — where
+CLAUDE.md lives) was bypassing redaction entirely; non-UTF-8 bodies were
+forwarded unredacted (now fail-closed with a 502); the NER pass applied
+name-level rewriting to tool output (now scoped like the regex rules);
+and a Presidio failure was silently swallowed (now logged). `init` also
+denies the agent Read access to `.redaction_rules`/`.redaction_map.json`,
+and `start` refuses to run as a zero-rule passthrough without
+`--allow-no-rules`. See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the full
+incident history and residual risks.
 
 ## Requirements
 

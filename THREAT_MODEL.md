@@ -35,6 +35,14 @@ stages of its own development.
 - **Un-authenticated network exposure.** The proxy binds to
   `127.0.0.1` only, by design. Do not expose it on a network
   interface without adding authentication first.
+- **Binary content blocks.** `document` (base64 PDF) and `image`
+  blocks pass through the proxy unredacted -- regex/NER cannot see
+  inside base64-encoded binary. Do not upload documents containing
+  sensitive values through the proxy and assume they were covered;
+  use `redact-file` on the extracted text instead.
+- **Sensitive values in URLs.** Query parameters and the request path
+  are forwarded as-is. The Messages API doesn't put user content
+  there, but a custom client could.
 
 ## Known failure modes (found in production use)
 
@@ -174,6 +182,63 @@ only by the OS-level lock.
 **Mitigation (for the remaining cleartext risk):** Add
 `.redaction_map.json*` to `.gitignore` (done by `init`, covers both the
 map file and its `.lock` sidecar).
+
+### 6. Leak paths found in a dedicated review (July 2026)
+
+A leak-focused audit of the whole pipeline (rather than incident
+response) found four ways sensitive data could still reach the API.
+All are fixed; listed here because each one is a lesson about where
+this class of tool goes wrong.
+
+**6a. `system` as a content-block list bypassed redaction entirely
+(fixed).** `redact_request_body()` only handled `system` as a plain
+string. Claude Code sends it as a *list of text blocks* (prompt
+caching requires per-block `cache_control` markers) -- and that list
+is where CLAUDE.md and project context live. The most sensitive part
+of every agent request went out raw. Lesson: test against what the
+client actually sends, not the API's simplest documented shape.
+
+**6b. Non-UTF-8 bodies were forwarded unredacted (fixed -- now fails
+closed).** The proxy's decode error path fell back to forwarding the
+original bytes. Any body that didn't decode (e.g. a client that
+gzips request bodies) bypassed redaction silently. Now rejected with
+a 502 and a loud log line: a body that can't be redacted must not be
+forwarded. Fail-open is the single worst default for a redaction
+tool.
+
+**6c. The Presidio pass applied name-level rewriting to tool blocks
+(fixed).** PERSON/LOCATION rewriting is name-level redaction by
+definition -- the exact rule class behind the stray-directory
+incident (section 4) -- but the NER pass ran regardless of scope,
+verified live: `/projects/John Smith Consulting/main.tf` inside a
+tool_result became `/projects/Morgan Rivera/main.tf`. NER now runs
+only where `scope: user-text-only` rules run. **Tradeoff:** genuine
+PII inside tool output (e.g. an agent `cat`ing a CSV of names) is no
+longer NER-redacted; value-level rules (GUID/IP) still apply there.
+
+**6d. A Presidio failure was silently swallowed (fixed -- now
+logged).** The NER pass was wrapped in a bare `except: pass`. If
+spaCy failed mid-session, every subsequent request shipped PII with
+only regex coverage and zero indication. Still fails open for
+availability, but now prints a WARNING per affected text.
+
+**6e. The rules and map files are readable by the agent (mitigated).**
+`.redaction_rules` (whose `real_value:` fields and name-rule regex
+patterns literally contain the secrets) and `.redaction_map.json`
+(fake -> real, all of it) sit in the project root. If the agent Reads
+either, the content enters a tool_result block -- where name-level
+rules deliberately don't apply -- and the real values go to the API.
+`init` now adds `permissions.deny` entries for `Read` on all three
+files. **Residual risk:** a Bash `cat`/`grep` of those files is not
+blocked (denying all file-reading shell commands isn't practical);
+value-level secrets self-heal (the GUID/IP rules re-redact them to
+their existing fakes) but name-level secrets would leak. If you use
+name-level rules, consider moving the rules/map out of the project
+tree entirely.
+
+Additionally, `start` now refuses to run with zero rules loaded
+(`--allow-no-rules` overrides) -- a redaction proxy silently running
+as a passthrough is a misconfiguration, not a mode.
 
 ## Reporting a new failure mode
 

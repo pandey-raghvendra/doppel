@@ -7,6 +7,7 @@ unit tested without spinning up a server or touching real files.
 import hashlib
 import json
 import re
+import sys
 import threading
 from pathlib import Path
 
@@ -398,15 +399,26 @@ def redact(text: str, ruleset: RuleSet, include_scoped: bool = True) -> str:
             # prioritizes availability of the redaction pipeline as a
             # whole over any single rule.
             continue
-    if ruleset.presidio_entities:
+    if ruleset.presidio_entities and include_scoped:
+        # Gated on include_scoped: PERSON/LOCATION rewriting is
+        # name-level redaction by definition, i.e. exactly the rule
+        # class that caused the stray-directory incident when applied
+        # to tool output (a real person's name inside a real path from
+        # `ls` got rewritten, and the model's next command targeted a
+        # path that didn't exist). Tool blocks get value-level rules
+        # only; PII inside tool output is a documented tradeoff, see
+        # THREAT_MODEL.md.
         try:
             text = redact_presidio(text, ruleset.presidio_entities, ruleset.mapping_store,
                                     thresholds=ruleset.presidio_thresholds)
-        except Exception:
-            # Same availability-over-any-single-rule tradeoff as the
-            # regex loop above: a NER failure must not 500 the whole
-            # request.
-            pass
+        except Exception as e:
+            # Availability over any single pass, same as the regex loop
+            # above -- but NOT silently: this is the entire PII pass
+            # failing, and the proxy layer can't log what core swallows.
+            # If spacy chokes mid-session, every later request would
+            # otherwise ship PII with nobody the wiser.
+            print(f"[redactctl] WARNING: Presidio pass failed, PII NOT "
+                  f"redacted for this text ({e})", file=sys.stderr)
     return text
 
 
@@ -493,8 +505,26 @@ def redact_request_body(body_text: str, ruleset: RuleSet) -> str:
             continue
         message["content"] = _redact_message_content(message["content"], ruleset)
 
-    if isinstance(data.get("system"), str):
-        data["system"] = redact(data["system"], ruleset, include_scoped=True)
+    # "system" comes in two shapes: a plain string, or -- what Claude
+    # Code actually sends, because prompt caching requires it -- a LIST
+    # of text blocks with cache_control markers. The list shape is
+    # where CLAUDE.md and project context live, so missing it meant the
+    # most sensitive part of every agent request went out unredacted
+    # (a real leak found in review, not hypothetical).
+    system = data.get("system")
+    if isinstance(system, str):
+        data["system"] = redact(system, ruleset, include_scoped=True)
+    elif isinstance(system, list):
+        data["system"] = [_redact_block(block, ruleset) for block in system]
+
+    # Tool definitions (names, descriptions, schemas -- MCP servers can
+    # embed real hostnames/IDs in theirs) and metadata get the safe,
+    # value-level pass. Not the scoped rules: tool definitions are
+    # structural, and rewriting fragments of them risks breaking
+    # tool-call matching the same way tool_result rewriting did.
+    for key in ("tools", "metadata"):
+        if key in data:
+            data[key] = _redact_safe_only(data[key], ruleset)
 
     return json.dumps(data)
 

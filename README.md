@@ -33,16 +33,23 @@ you -> redactctl proxy -> [redact] -> api.anthropic.com
 - **`redactctl/core.py`** — pure redaction/restore logic: YAML rule loading,
   deterministic fake generation (`fake_ip`, `fake_guid`, `fake_name`), a
   `MappingStore` that persists fake→real pairs so the proxy (writer) and the
-  restore hook (reader, separate process) can agree on them.
-- **`redactctl.py`** — CLI (`init` / `start` / `status` / `test` /
-  `restore-hook`) and the FastAPI proxy that sits in front of
-  `api.anthropic.com`.
+  restore hook (reader, separate process) can agree on them, and
+  `redact_request_body()` for structure-aware redaction of Messages API
+  requests (see Path drift in `THREAT_MODEL.md`).
+- **`redactctl/cli.py`** — CLI (`init` / `start` / `status` / `test` /
+  `restore-hook` / `redact-file` / `restore-file`) and the FastAPI proxy
+  that sits in front of `api.anthropic.com`. `redactctl.py` at the repo
+  root is a thin launcher for it.
 - Regex rules cover GUIDs/IPs by default. A `PRESIDIO` rule category adds
   NER-based name/email/phone detection via Microsoft's
   [Presidio](https://github.com/microsoft/presidio), off by default (heavier
-  dependency, needs tuning — see `.redaction_rules` after running `init`).
+  dependency; per-entity-type score thresholds are supported since
+  Presidio's recognizers don't share one confidence range — see
+  `.redaction_rules` after running `init`).
 
 ## Quick start
+
+**Agentic tools (Claude Code, Cline)** — a live proxy in front of the API:
 
 ```bash
 python3 redactctl.py init
@@ -54,21 +61,35 @@ claude
 
 `init` also wires the restore hook into `.claude/settings.json` for you.
 
+**Plain Claude.ai chat** — no proxy is possible there (Claude Desktop
+overrides `ANTHROPIC_BASE_URL` by design), so redact before you paste and
+restore after you copy the reply back out:
+
+```bash
+python3 redactctl.py redact-file notes.csv | pbcopy   # paste into the chat
+# ... paste Claude's reply into reply.txt ...
+python3 redactctl.py restore-file reply.txt
+```
+
+Both commands accept `-` for stdin and `--out <path>` instead of stdout.
+
 ## Status
 
 Phase 1 (GUID/IP redaction + restore, CLI, proxy) done and tested —
 `tests/` covers `core.py`, and the CLI/proxy layer has been smoke-tested
 end to end (init, test, status, start, restore-hook for Write/Edit/Bash).
 
-Phase 2 (Presidio-based name/PII redaction) is in, off by default. Needs
-real-world tuning of the score threshold.
+Phase 2 (Presidio-based name/PII redaction) is in, off by default, with
+per-entity-type score thresholds for tuning.
 
-Phase 3 (a redact-then-paste utility for plain Claude.ai chat uploads,
-where a proxy isn't possible) is not started.
+Phase 3 (`redact-file`/`restore-file` for plain Claude.ai chat uploads) is
+done.
 
-See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the incidents that shaped the
-current design, including the still-relevant caution around name/path-level
-redaction rules and resent conversation history.
+The path-drift issue (redacting resent agent conversation history could
+rewrite real tool output, e.g. a real filesystem path from a prior `pwd`)
+has a root fix: `redact_request_body()` only applies risky rules to
+genuine text content, never to `tool_use`/`tool_result` blocks. See
+[`THREAT_MODEL.md`](THREAT_MODEL.md) for the full incident history.
 
 ## Requirements
 

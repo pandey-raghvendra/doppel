@@ -17,13 +17,30 @@ COMMANDS
                          Internal -- this is what Claude Code's
                          PreToolUse hook actually calls. You shouldn't
                          need to run this by hand.
+  redactctl.py redact-file <path|->
+                         For plain Claude.ai chat (no proxy possible
+                         there -- Claude Desktop overrides
+                         ANTHROPIC_BASE_URL by design). Redacts a
+                         doc/CSV/text file (or stdin with "-") and
+                         prints the result, ready to paste into a
+                         chat. Same rules/mapping as the proxy uses.
+  redactctl.py restore-file <path|->
+                         The other half: takes text you pasted back
+                         out of a Claude.ai chat (or stdin) and
+                         restores real values before you save it.
 
-QUICK START
+QUICK START (agentic tools, e.g. Claude Code)
   python3 redactctl.py init
   python3 redactctl.py test
   python3 redactctl.py start &
   export ANTHROPIC_BASE_URL=http://localhost:8642
   claude
+
+QUICK START (plain Claude.ai chat upload, no proxy)
+  python3 redactctl.py init
+  python3 redactctl.py redact-file notes.csv | pbcopy   # paste into the chat
+  # ... paste Claude's reply into reply.txt ...
+  python3 redactctl.py restore-file reply.txt
 
 WHY THIS EXISTS (context if you're new to this file)
   Redacts outbound requests to Claude (subscription IDs, IPs -- see
@@ -382,6 +399,42 @@ def cmd_restore_hook(args):
         print(json.dumps({"continue": True}))
 
 
+def _read_input_text(path_arg: str) -> str:
+    if path_arg == "-":
+        return sys.stdin.read()
+    return Path(path_arg).read_text()
+
+
+def _write_output_text(text: str, out_arg: str):
+    if out_arg:
+        Path(out_arg).write_text(text)
+        print(f"[redactctl] wrote {out_arg}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_redact_file(args):
+    """For plain Claude.ai chat uploads, where no proxy is possible
+    (Claude Desktop overrides ANTHROPIC_BASE_URL by design): redact a
+    doc/CSV/text file so it's safe to paste into a chat. Plain
+    text-level redact(), not redact_request_body() -- there's no
+    resent tool-call history or tool_result content here, just a
+    document a human is about to paste, so every rule (including
+    scope: user-text-only ones) is safe to apply everywhere."""
+    ruleset = load_ruleset()
+    text = _read_input_text(args.file)
+    _write_output_text(redact(text, ruleset), args.out)
+
+
+def cmd_restore_file(args):
+    """The other half of cmd_redact_file: restore real values into
+    text copied back out of a Claude.ai chat, before you save or use
+    it."""
+    mapping = _mapping_store.load()
+    text = _read_input_text(args.file)
+    _write_output_text(restore(text, mapping), args.out)
+
+
 def cmd_start(args):
     try:
         import httpx
@@ -466,6 +519,18 @@ def main():
 
     sub.add_parser("restore-hook", help="Internal: called by Claude Code's PreToolUse hook")
 
+    p_redact_file = sub.add_parser(
+        "redact-file", help="Redact a doc/CSV/text file for pasting into plain Claude.ai chat"
+    )
+    p_redact_file.add_argument("file", help="Path to redact, or '-' for stdin")
+    p_redact_file.add_argument("--out", help="Write to this path instead of stdout")
+
+    p_restore_file = sub.add_parser(
+        "restore-file", help="Restore real values into text copied back out of a Claude.ai chat"
+    )
+    p_restore_file.add_argument("file", help="Path to restore, or '-' for stdin")
+    p_restore_file.add_argument("--out", help="Write to this path instead of stdout")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -478,6 +543,10 @@ def main():
         cmd_test(args)
     elif args.command == "restore-hook":
         cmd_restore_hook(args)
+    elif args.command == "redact-file":
+        cmd_redact_file(args)
+    elif args.command == "restore-file":
+        cmd_restore_file(args)
     else:
         parser.print_help()
 

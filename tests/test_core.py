@@ -363,6 +363,44 @@ def test_presidio_runs_after_regex_rules_without_interference(mapping_store):
 
 
 # ---------------------------------------------------------------------
+# TUNING: a single global score_threshold doesn't work across entity
+# types -- a real, correctly-formatted phone number scored only 0.4
+# under Presidio's default recognizer, below the 0.5 default cutoff,
+# and was silently left un-redacted. Per-rule "threshold" lets a
+# lower-confidence entity type like PHONE_NUMBER use its own cutoff
+# without lowering the bar for every other entity type.
+# ---------------------------------------------------------------------
+
+@requires_presidio
+def test_presidio_per_entity_threshold_catches_low_confidence_phone(mapping_store):
+    data = {"rules": [
+        {"id": "pii", "category": "PRESIDIO", "entities": ["PERSON", "EMAIL_ADDRESS"]},
+        {"id": "phone", "category": "PRESIDIO", "entities": ["PHONE_NUMBER"], "threshold": 0.35},
+    ]}
+    ruleset = RuleSet.from_yaml_data(data, mapping_store=mapping_store, strict=True)
+    assert ruleset.presidio_thresholds == {"PHONE_NUMBER": 0.35}
+
+    text = "John Smith called from 415-555-1234."
+    result = redact(text, ruleset)
+    assert "415-555-1234" not in result, (
+        "PHONE_NUMBER's per-rule threshold (0.35) should catch a real number that "
+        "the 0.5 global default would have missed"
+    )
+
+
+@requires_presidio
+def test_presidio_default_threshold_applies_without_per_rule_override(mapping_store):
+    """An entity type with no explicit 'threshold' in its rule must
+    still fall back to the global default, not to 0 (which would
+    redact everything Presidio finds regardless of confidence)."""
+    ruleset = RuleSet.from_yaml_data(
+        {"rules": [{"id": "pii", "category": "PRESIDIO", "entities": ["PERSON"]}]},
+        mapping_store=mapping_store,
+    )
+    assert ruleset.presidio_thresholds == {}
+
+
+# ---------------------------------------------------------------------
 # INCIDENT: Presidio returned overlapping spans for the same stretch of
 # text (a full EMAIL_ADDRESS match and a lower-confidence URL match
 # covering just its domain). Replacing both independently, each against

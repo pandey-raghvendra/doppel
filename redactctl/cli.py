@@ -110,13 +110,20 @@ DEFAULT_RULES = """rules:
   # DISABLED BY DEFAULT -- requires `pip install presidio-analyzer spacy`
   # plus `python -m spacy download en_core_web_sm`. NER-based, not
   # regex: finds names/emails/phone numbers Presidio recognizes and
-  # gives each a deterministic fake (see fake_name() in core.py).
-  # Expect to need score_threshold tuning -- low-confidence entity
-  # types (e.g. loosely-matched phone numbers) can be missed.
+  # gives each a deterministic fake (see fake_name() in core.py). The
+  # optional per-rule "threshold" overrides the 0.5 default for just
+  # the entity types listed in that rule -- PHONE_NUMBER needed this
+  # in testing, since Presidio's phone recognizer scored a real,
+  # correctly-formatted number only 0.4, below the default cutoff.
   #
   # - id: presidio-pii
   #   category: PRESIDIO
-  #   entities: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER]
+  #   entities: [PERSON, EMAIL_ADDRESS]
+  #
+  # - id: presidio-phone
+  #   category: PRESIDIO
+  #   entities: [PHONE_NUMBER]
+  #   threshold: 0.35
 """
 
 DEFAULT_HOOK_ENTRY = {

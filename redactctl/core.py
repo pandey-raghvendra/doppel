@@ -209,18 +209,29 @@ def _drop_overlapping_spans(results):
     return kept
 
 
+DEFAULT_PRESIDIO_THRESHOLD = 0.5
+
+
 def redact_presidio(text: str, entities: list, mapping_store: MappingStore = None,
-                     score_threshold: float = 0.5) -> str:
+                     thresholds: dict = None, default_threshold: float = DEFAULT_PRESIDIO_THRESHOLD) -> str:
     """Run Presidio NER over text and replace detected entities with
     deterministic fakes. This is a separate pass from the regex rules
     in RuleSet -- Presidio needs the full text to resolve entity spans
     by offset, it can't be expressed as a single-match regex replacer.
     Applied after regex rules so GUID/IP substitutions already happened
-    and won't confuse the NER model."""
+    and won't confuse the NER model.
+
+    A single global score_threshold doesn't work in practice: Presidio's
+    built-in recognizers have very different natural confidence ranges
+    per entity type (e.g. a loosely-formatted phone number can score
+    ~0.4 while a well-formed email scores 1.0), so `thresholds` allows
+    a per-entity_type override, falling back to `default_threshold` for
+    any entity type not explicitly configured."""
+    thresholds = thresholds or {}
     analyzer = _get_presidio_analyzer()
     results = [
         r for r in analyzer.analyze(text=text, entities=entities, language="en")
-        if r.score >= score_threshold
+        if r.score >= thresholds.get(r.entity_type, default_threshold)
     ]
     results = _drop_overlapping_spans(results)
     # Replace from the end of the string backward so earlier offsets
@@ -245,11 +256,13 @@ class RuleSet:
     """A compiled, ready-to-use set of redaction rules."""
 
     def __init__(self, rules: list, warnings: list = None,
-                 presidio_entities: list = None, mapping_store: MappingStore = None):
+                 presidio_entities: list = None, mapping_store: MappingStore = None,
+                 presidio_thresholds: dict = None):
         self.rules = rules  # list of (id, compiled_pattern, replacer)
         self.warnings = warnings or []
         self.presidio_entities = presidio_entities or []
         self.mapping_store = mapping_store
+        self.presidio_thresholds = presidio_thresholds or {}  # entity_type -> score threshold
 
     @staticmethod
     def _make_generator_replacer(generator_fn, mapping_store):
@@ -275,6 +288,7 @@ class RuleSet:
         rules = []
         warnings = []
         presidio_entities = []
+        presidio_thresholds = {}
 
         for r in (data or {}).get("rules", []):
             rule_id = r.get("id", "unnamed-rule")
@@ -289,6 +303,10 @@ class RuleSet:
                     warnings.append(msg)
                     continue
                 presidio_entities.extend(entities)
+                threshold = r.get("threshold")
+                if threshold is not None:
+                    for entity in entities:
+                        presidio_thresholds[entity] = threshold
                 continue
 
             try:
@@ -322,7 +340,8 @@ class RuleSet:
 
             rules.append((rule_id, pattern, replacer))
 
-        return cls(rules, warnings, presidio_entities=presidio_entities, mapping_store=mapping_store)
+        return cls(rules, warnings, presidio_entities=presidio_entities, mapping_store=mapping_store,
+                   presidio_thresholds=presidio_thresholds)
 
 
 def redact(text: str, ruleset: RuleSet) -> str:
@@ -341,7 +360,8 @@ def redact(text: str, ruleset: RuleSet) -> str:
             continue
     if ruleset.presidio_entities:
         try:
-            text = redact_presidio(text, ruleset.presidio_entities, ruleset.mapping_store)
+            text = redact_presidio(text, ruleset.presidio_entities, ruleset.mapping_store,
+                                    thresholds=ruleset.presidio_thresholds)
         except Exception:
             # Same availability-over-any-single-rule tradeoff as the
             # regex loop above: a NER failure must not 500 the whole

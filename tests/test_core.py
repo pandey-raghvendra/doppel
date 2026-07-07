@@ -144,13 +144,13 @@ def test_single_bad_rule_does_not_crash_whole_redaction():
 def test_name_rules_do_rewrite_path_like_strings_this_is_a_known_risk():
     rule = {
         "id": "client-name",
-        "pattern": r"(?i)Lockton",
+        "pattern": r"(?i)Acme",
         "replacement": "ClientCorp",
-        "real_value": "Lockton",
+        "real_value": "Acme",
         "category": "PROJECT",
     }
     ruleset = RuleSet.from_yaml_data({"rules": [rule]})
-    path = "/Users/dev/lockton-mx/terraform/main.tf"
+    path = "/Users/dev/acme-mx/terraform/main.tf"
     result = redact(path, ruleset)
     assert result != path, (
         "This is EXPECTED given a plain redact() call with no scoping -- "
@@ -178,9 +178,9 @@ def test_name_rules_do_rewrite_path_like_strings_this_is_a_known_risk():
 
 CLIENT_NAME_RULE = {
     "id": "client-name",
-    "pattern": r"(?i)Lockton",
+    "pattern": r"(?i)Acme",
     "replacement": "ClientCorp",
-    "real_value": "Lockton",
+    "real_value": "Acme",
     "category": "PROJECT",
     "scope": "user-text-only",
 }
@@ -188,7 +188,7 @@ CLIENT_NAME_RULE = {
 
 def test_redact_include_scoped_false_skips_scoped_rules():
     ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]})
-    text = "the lockton-mx project"
+    text = "the acme-mx project"
     assert redact(text, ruleset, include_scoped=True) != text
     assert redact(text, ruleset, include_scoped=False) == text, (
         "scope: user-text-only rules must be skippable for tool-originated content"
@@ -201,7 +201,7 @@ def test_redact_request_body_protects_tool_result_but_redacts_text_blocks(mappin
     if echoed back from a prior `pwd`). Only the text block's copy may
     be rewritten by the scope: user-text-only rule."""
     ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE, GUID_RULE]}, mapping_store)
-    real_path = "/Users/dev/lockton-mx/terraform"
+    real_path = "/Users/dev/acme-mx/terraform"
     body = {
         "model": "claude-x",
         "messages": [
@@ -221,7 +221,7 @@ def test_redact_request_body_protects_tool_result_but_redacts_text_blocks(mappin
     text_block = result["messages"][0]["content"][0]["text"]
     tool_result_block = result["messages"][2]["content"][0]["content"]
 
-    assert "lockton-mx" not in text_block, "genuine text content must still get scoped rules"
+    assert "acme-mx" not in text_block, "genuine text content must still get scoped rules"
     assert tool_result_block == real_path, (
         "tool_result content must be left untouched by scope: user-text-only rules, "
         "even though the Messages API wraps it in a role: 'user' message"
@@ -264,9 +264,9 @@ def test_redact_request_body_handles_plain_string_content(mapping_store):
     """The simpler, non-block Messages API shape (message.content as a
     plain string) is always genuine conversational text."""
     ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]}, mapping_store)
-    body = {"messages": [{"role": "user", "content": "the lockton-mx project"}]}
+    body = {"messages": [{"role": "user", "content": "the acme-mx project"}]}
     result = json.loads(redact_request_body(json.dumps(body), ruleset))
-    assert "lockton-mx" not in result["messages"][0]["content"]
+    assert "acme-mx" not in result["messages"][0]["content"]
 
 
 def test_redact_request_body_falls_back_for_non_messages_shape(mapping_store):
@@ -295,7 +295,7 @@ def test_redact_request_body_redacts_system_as_block_list(mapping_store):
     body = {
         "system": [
             {"type": "text",
-             "text": 'CLAUDE.md: lockton subscription "323141ce-56db-43a4-a7fb-6e491d10ddd6"',
+             "text": 'CLAUDE.md: acme subscription "323141ce-56db-43a4-a7fb-6e491d10ddd6"',
              "cache_control": {"type": "ephemeral"}},
         ],
         "messages": [{"role": "user", "content": "hi"}],
@@ -303,7 +303,7 @@ def test_redact_request_body_redacts_system_as_block_list(mapping_store):
     result = json.loads(redact_request_body(json.dumps(body), ruleset))
     system_block = result["system"][0]
     assert "323141ce" not in system_block["text"]
-    assert "lockton" not in system_block["text"].lower(), (
+    assert "acme" not in system_block["text"].lower(), (
         "system prompt is genuine prose context -- scoped rules apply too"
     )
     assert system_block["cache_control"] == {"type": "ephemeral"}, (
@@ -319,13 +319,13 @@ def test_redact_request_body_redacts_tools_and_metadata_with_safe_rules(mapping_
     body = {
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"name": "query_db", "description":
-                   "Queries lockton db 323141ce-56db-43a4-a7fb-6e491d10ddd6"}],
+                   "Queries acme db 323141ce-56db-43a4-a7fb-6e491d10ddd6"}],
         "metadata": {"user_id": "323141ce-56db-43a4-a7fb-6e491d10ddd6"},
     }
     result = json.loads(redact_request_body(json.dumps(body), ruleset))
     assert "323141ce" not in result["tools"][0]["description"]
     assert "323141ce" not in result["metadata"]["user_id"]
-    assert "lockton" in result["tools"][0]["description"], (
+    assert "acme" in result["tools"][0]["description"], (
         "scoped rules must NOT rewrite tool definitions"
     )
 
@@ -341,10 +341,10 @@ def test_redact_request_body_redacts_tools_and_metadata_with_safe_rules(mapping_
 # ---------------------------------------------------------------------
 
 def test_scrub_replaces_known_real_values_with_their_existing_fakes():
-    mapping = {"ClientCorp": "Lockton", "10.99.1.5": "10.20.30.40"}
-    text = "the map says Lockton lives at 10.20.30.40"
+    mapping = {"ClientCorp": "Acme", "10.99.1.5": "10.20.30.40"}
+    text = "the map says Acme lives at 10.20.30.40"
     result = scrub_known_real_values(text, mapping)
-    assert "Lockton" not in result
+    assert "Acme" not in result
     assert "10.20.30.40" not in result
     assert "ClientCorp" in result and "10.99.1.5" in result, (
         "must reuse the EXISTING fakes so the model's view stays consistent"
@@ -366,18 +366,18 @@ def test_scrub_catches_map_contents_leaking_through_tool_result(mapping_store):
     must still be scrubbed from the outbound body."""
     ruleset = RuleSet.from_yaml_data({"rules": [CLIENT_NAME_RULE]}, mapping_store)
     # The scoped rule records its pair when the ruleset is built.
-    assert mapping_store.load() == {"ClientCorp": "Lockton"}
+    assert mapping_store.load() == {"ClientCorp": "Acme"}
 
     body = {"messages": [{"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "t1",
-         "content": '{"ClientCorp": "Lockton"}'},  # cat .redaction_map.json output
+         "content": '{"ClientCorp": "Acme"}'},  # cat .redaction_map.json output
     ]}]}
     after_rules = redact_request_body(json.dumps(body), ruleset)
-    assert "Lockton" in after_rules, (
+    assert "Acme" in after_rules, (
         "precondition: scoped rules leave tool_result alone, so the leak exists"
     )
     after_scrub = scrub_known_real_values(after_rules, mapping_store.load())
-    assert "Lockton" not in after_scrub, "the outbound guard must close it"
+    assert "Acme" not in after_scrub, "the outbound guard must close it"
 
 
 # ---------------------------------------------------------------------

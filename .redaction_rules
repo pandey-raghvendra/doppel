@@ -1,0 +1,63 @@
+rules:
+  # Azure Subscription/Tenant IDs (GUIDs). Deterministic fake per
+  # distinct real value -- same real GUID always maps to the same
+  # fake one, different GUIDs get different fakes, so Claude can still
+  # reason about "do these match" without seeing real values.
+  - id: azure-guids
+    pattern: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+    category: KEY
+
+  # All IPv4 addresses/CIDRs, public and private. Same
+  # deterministic-per-value approach as GUIDs above.
+  - id: all-ipv4
+    pattern: '\b(?:\d{1,3}\.){3}\d{1,3}\b(?:/\d{1,2})?'
+    category: IP
+
+  # Azure DevOps org/project URLs.
+  - id: ado-org
+    pattern: 'dev\.azure\.com/[a-zA-Z0-9-]+'
+    replacement: 'dev.azure.com/redacted-org'
+    category: HOST
+
+  # DISABLED BY DEFAULT -- see module docstring above for why. The
+  # "scope: user-text-only" line below is the fix that makes these
+  # safe to enable: the proxy now redacts request bodies with
+  # awareness of Messages API structure (see redact_request_body() in
+  # core.py) and only applies scope: user-text-only rules to "text"
+  # content blocks, never to tool_use/tool_result blocks -- which is
+  # where the real Bash output (a real `pwd`/`ls` path) that caused
+  # the original stray-directory incident actually lived. Without
+  # "scope: user-text-only" a rule still applies everywhere, same as
+  # before this fix -- so leaving it off is still the historically
+  # risky configuration.
+  #
+  # - id: client-name
+  #   pattern: '(?i)Lockton'
+  #   replacement: 'ClientCorp'
+  #   real_value: 'Lockton'
+  #   category: PROJECT
+  #   scope: user-text-only
+  #
+  # - id: mx-region-token
+  #   pattern: '(?i)([-_])mx([-_])'
+  #   replacement: '${1}xx${2}'
+  #   category: PROJECT
+  #   scope: user-text-only
+
+  # DISABLED BY DEFAULT -- requires `pip install presidio-analyzer spacy`
+  # plus `python -m spacy download en_core_web_sm`. NER-based, not
+  # regex: finds names/emails/phone numbers Presidio recognizes and
+  # gives each a deterministic fake (see fake_name() in core.py). The
+  # optional per-rule "threshold" overrides the 0.5 default for just
+  # the entity types listed in that rule -- PHONE_NUMBER needed this
+  # in testing, since Presidio's phone recognizer scored a real,
+  # correctly-formatted number only 0.4, below the default cutoff.
+  #
+  # - id: presidio-pii
+  #   category: PRESIDIO
+  #   entities: [PERSON, EMAIL_ADDRESS]
+  #
+  # - id: presidio-phone
+  #   category: PRESIDIO
+  #   entities: [PHONE_NUMBER]
+  #   threshold: 0.35

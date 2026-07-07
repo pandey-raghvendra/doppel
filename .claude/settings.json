@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/raghvendrapandey/Documents/personaal/doppel/redactctl.py restore-hook"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(./.redaction_rules)",
+      "Read(./.redaction_map.json)",
+      "Read(./.redaction_map.json.lock)"
+    ]
+  }
+}

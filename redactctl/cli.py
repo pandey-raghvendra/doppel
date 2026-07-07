@@ -122,9 +122,9 @@ DEFAULT_RULES = """rules:
   # risky configuration.
   #
   # - id: client-name
-  #   pattern: '(?i)Lockton'
+  #   pattern: '(?i)Acme'
   #   replacement: 'ClientCorp'
-  #   real_value: 'Lockton'
+  #   real_value: 'Acme'
   #   category: PROJECT
   #   scope: user-text-only
   #

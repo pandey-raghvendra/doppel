@@ -554,8 +554,8 @@ def scrub_known_real_values(text: str, mapping: dict) -> str:
     sensitive; this pass guarantees that values already PROVEN
     sensitive never leave, no matter how they resurfaced.
 
-    Exact-string matching only: 'Lockton' in the map won't catch a
-    'lockton' the case-insensitive rule would have -- this is a
+    Exact-string matching only: 'Acme' in the map won't catch a
+    'acme' the case-insensitive rule would have -- this is a
     backstop for known values, not a second rule engine. Longest real
     values first, same substring-corruption logic as restore()."""
     for fake, real in sorted(mapping.items(), key=lambda kv: len(kv[1]), reverse=True):

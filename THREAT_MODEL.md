@@ -246,8 +246,8 @@ real values would go to the API. Three defenses, outermost first:
    injected via tool_result left the proxy with every real value
    replaced by its established fake.
 
-**Residual risk:** the guard is exact-string ("Lockton" in the map
-won't catch a "lockton" the case-insensitive rule would have), and it
+**Residual risk:** the guard is exact-string ("Acme" in the map
+won't catch a "acme" the case-insensitive rule would have), and it
 only covers values already recorded in the map. A name-level real
 value that has never been through a rule (rules file edited but proxy
 not restarted, say) isn't in the map yet.

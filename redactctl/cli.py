@@ -7,6 +7,12 @@ COMMANDS
                          wires the restore hook into .claude/settings.json,
                          adds .redaction_map.json to .gitignore.
   redactctl.py start     Runs the redaction proxy (default port 8642).
+                         --audit-log <path>: DEBUGGING ONLY, off by
+                         default. Appends every outbound
+                         (post-redaction) request body to <path> so
+                         you can grep/verify exactly what left your
+                         machine -- fakes only, real values are never
+                         written there.
   redactctl.py status    Shows rule count, map entry count, whether the
                          proxy is currently reachable, whether the hook
                          is wired in settings.json.
@@ -70,6 +76,7 @@ import json
 import os
 import socket
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from redactctl.core import (
@@ -544,6 +551,18 @@ def cmd_start(args):
               "passthrough is genuinely what you want.", file=sys.stderr)
         sys.exit(1)
 
+    audit_log_path = None
+    audit_log_lock = None
+    if args.audit_log:
+        import threading
+        audit_log_path = Path(args.audit_log)
+        audit_log_lock = threading.Lock()
+        print(f"[redactctl] AUDIT LOG enabled -- every outbound (post-redaction) "
+              f"request body will be appended to {audit_log_path.resolve()}. "
+              f"Debugging/verification only -- this file only ever contains what "
+              f"actually left your machine (fakes, not reals), but treat it as a "
+              f"conversation record and don't commit it.", file=sys.stderr)
+
     app = FastAPI()
     client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
     HOP_BY_HOP_REQUEST_HEADERS = {"host", "content-length"}
@@ -581,6 +600,20 @@ def cmd_start(args):
         # rule pass are included.
         redacted_text = scrub_known_real_values(redacted_text, _mapping_store.load())
         redacted_bytes = redacted_text.encode("utf-8")
+
+        if audit_log_path:
+            # Exactly what's about to leave the machine, post-redaction
+            # and post-scrub -- the only trustworthy inspection point,
+            # since everything past this line is over HTTPS. Local file
+            # only, never transmitted; contains fakes, not real values
+            # (that's the entire thing being audited).
+            with audit_log_lock:
+                with open(audit_log_path, "a") as f:
+                    f.write(json.dumps({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "path": path,
+                        "body": redacted_text,
+                    }) + "\n")
 
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_REQUEST_HEADERS}
         url = f"{UPSTREAM}/{path}"
@@ -633,6 +666,11 @@ def main():
     p_start.add_argument("--port", type=int, default=8642)
     p_start.add_argument("--allow-no-rules", action="store_true",
                          help="Start even with zero redaction rules loaded (passthrough proxy)")
+    p_start.add_argument("--audit-log",
+                         help="DEBUGGING ONLY, off by default. Append every outbound "
+                              "(post-redaction, post-scrub) request body to this file, "
+                              "one JSON line per request, so you can grep/verify exactly "
+                              "what left your machine.")
 
     p_status = sub.add_parser("status", help="Check current setup")
     p_status.add_argument("--port", type=int, default=8642)

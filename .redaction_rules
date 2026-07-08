@@ -32,9 +32,9 @@ rules:
   # risky configuration.
   #
   # - id: client-name
-  #   pattern: '(?i)Lockton'
+  #   pattern: '(?i)'
   #   replacement: 'ClientCorp'
-  #   real_value: 'Lockton'
+  #   real_value: ''
   #   category: PROJECT
   #   scope: user-text-only
   #

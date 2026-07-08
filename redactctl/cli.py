@@ -67,6 +67,7 @@ WHY THIS EXISTS (context if you're new to this file)
 """
 import argparse
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -417,6 +418,22 @@ def cmd_restore_hook(args):
     except Exception:
         print(json.dumps({"continue": True}))
         return
+
+    # RULES_PATH/MAP_PATH are bare relative Paths, resolved against
+    # whatever cwd this subprocess happens to inherit when Claude Code
+    # invokes the hook -- which is not guaranteed to be the project
+    # root (sandboxed hook execution, an unusual launch cwd, etc). The
+    # hook event includes an explicit "cwd" for exactly this reason:
+    # anchor to it rather than trust ambient process cwd. A silent
+    # mismatch here means the proxy and the hook read/write two
+    # different mapping files -- the hook finds nothing to restore and
+    # a fake value survives into the written file, with no error.
+    event_cwd = event.get("cwd")
+    if event_cwd and os.path.isdir(event_cwd):
+        try:
+            os.chdir(event_cwd)
+        except OSError:
+            pass
 
     tool_input = event.get("tool_input", {})
     tool_name = event.get("tool_name", "")

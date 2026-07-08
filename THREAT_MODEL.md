@@ -264,6 +264,37 @@ Additionally, `start` now refuses to run with zero rules loaded
 (`--allow-no-rules` overrides) -- a redaction proxy silently running
 as a passthrough is a misconfiguration, not a mode.
 
+### 7. Restore-hook resolved the mapping file against the wrong cwd (fixed)
+
+**What happened:** First real-world usage report. `RULES_PATH`/
+`MAP_PATH` are bare relative `Path` objects, resolved against whatever
+working directory the hook subprocess happens to inherit when Claude
+Code invokes it. The proxy and the hook are separate processes -- if
+the subprocess's actual OS cwd at invocation ever diverged from the
+project root the proxy was started in (a sandboxed hook-execution
+environment, an unusual launch cwd), the hook silently read/wrote a
+*different* `.redaction_map.json` than the one the proxy had just
+written to. Symptom: the proxy correctly redacted a real IP to a fake
+one, Claude wrote the fake value into a file, and restore-hook
+returned `{"continue": true}` -- no error, the fake value just stayed
+on disk.
+
+**Why it was hard to spot:** Confirmed via Claude Code's own hook
+documentation (not guessed) that the `PreToolUse` hook event includes
+an explicit `"cwd"` field precisely because a hook subprocess's
+ambient cwd isn't guaranteed to match the project root. The hook was
+never using it.
+
+**Fix:** `cmd_restore_hook` now does `os.chdir(event["cwd"])` before
+any path-relative operation, anchoring to the cwd Claude Code
+explicitly reports rather than trusting the subprocess's ambient one.
+Falls back to the old ambient-cwd behavior if the event has no `cwd`
+field. Covered by `tests/test_cli.py`, which runs the actual
+`redactctl.py` launcher as a subprocess (not just calling the Python
+function in-process) with its OS cwd deliberately set to a directory
+that is NOT the project, to catch exactly this class of bug --
+in-process function calls can't reproduce a subprocess cwd mismatch.
+
 ## Reporting a new failure mode
 
 If you find a case where a redacted value reaches Claude when it
